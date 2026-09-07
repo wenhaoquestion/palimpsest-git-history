@@ -9,6 +9,7 @@ import {
   InspectIcon,
   OverviewIcon,
   SearchIcon,
+  ExpandIcon,
 } from './icons'
 
 interface AppHeaderProps {
@@ -59,7 +60,7 @@ export function AppHeader({
         {!isLinuxHistorySite && onOpenWorkspace ? <button className="header-button workbench-button" type="button" onClick={onOpenWorkspace} aria-label="Working changes" title="Working changes, commits, and branches">
           <BranchIcon /><span>Changes</span>
         </button> : null}
-        {!isLinuxHistorySite && isVSCode ? <button className="header-button detach-button" type="button" onClick={openInNewWindow} aria-label="Open in new window" title="Open in new window"><span aria-hidden="true">↗</span></button> : null}
+        {!isLinuxHistorySite && isVSCode ? <button className="header-button detach-button" type="button" onClick={openInNewWindow} aria-label="Open in new window" title="Open in new window"><ExpandIcon /></button> : null}
         {!isLinuxHistorySite ? <button className="header-button open-repository-button" type="button" onClick={onOpenRepository} aria-label="Open repository">
           <FolderIcon /><span>Open</span>
         </button> : null}

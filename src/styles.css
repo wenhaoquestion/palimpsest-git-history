@@ -790,6 +790,9 @@
     .header-actions { gap: 4px; }
     .workspace,
     .app-shell.is-overview .workspace { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+    /* Fit the scene into the visible area above the inspector sheet. */
+    .app-shell:not(.is-overview) .visualization-stage { height: 42%; }
+    .repository-canvas { min-height: 0 !important; }
     .commit-rail__header { justify-content: center; padding: 0 5px; }
     .commit-rail__position, .commit-rail__list, .commit-rail__more { display: none; }
     .commit-rail__viewport { grid-template-rows: 1fr; }
@@ -834,10 +837,13 @@
     .app-shell { min-height: 680px; }
     .brand-group { flex: 1; }
     .wordmark { font-size: 13px; letter-spacing: .2em; }
+    .wordmark[aria-label="Palimpsest"] { display: none; }
     .repo-identity > svg, .header-action-rule, .search-button, .help-button { display: none; }
     .repo-name { max-width: 96px; font-size: 11px; }
     .workspace,
     .app-shell.is-overview .workspace { grid-template-columns: 1fr; }
+    .app-shell:not(.is-overview) .visualization-stage { height: 44%; }
+    .app-shell:not(.is-overview):has(.empty-inspector) .visualization-stage { height: 43%; }
     .commit-column { display: none; }
     .inspector-column {
       right: 0;
