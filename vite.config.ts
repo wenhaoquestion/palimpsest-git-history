@@ -21,7 +21,7 @@ export default defineConfig({
       // The selected repository can live under this workspace and may contain
       // hundreds of thousands of files. Git is the data source; Vite should
       // not watch that checkout for frontend hot reloads.
-      ignored: ['**/.palimpsest-target/**'],
+      ignored: ['**/.palimpsest-target/**', '**/linux-history-website/data/**', '**/linux-history-website/deploy/**'],
     },
   },
   preview: {

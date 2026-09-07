@@ -4,7 +4,7 @@ Report a problem or request a feature through [GitHub Issues](https://github.com
 
 ## Before reporting a problem
 
-Run **Palimpsest: Refresh Git History** after changing commits or branches. If the view still looks stale, close it and run **Palimpsest: Open Git History** again.
+Run **Palimpsest: Refresh Git History** after changing commits or branches outside the workbench. If the view still looks stale, close it and run **Palimpsest: Open Git Workbench** again. The Changes page has a separate refresh button for the current working tree.
 
 For an opening error, confirm that:
 

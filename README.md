@@ -1,6 +1,6 @@
 # PALIMPSEST
 
-A Git history explorer for any filesystem repository, available as a VS Code extension and a standalone web app. Directories become districts, files become structures, and the timeline replays the history of the selected branch or all reachable refs. Git is read directly from disk; no account or cloud service is required.
+A Git workbench for any filesystem repository, available as a VS Code extension and a standalone web app. Review working changes, stage and commit, manage branches and remotes, and explore history as an interactive landscape. Git operates directly on your local repository; no Palimpsest account or cloud service is required.
 
 ## VS Code extension
 
@@ -11,11 +11,11 @@ npm install
 npm run package:extension
 ```
 
-In VS Code, run **Extensions: Install from VSIX…** and choose `releases/palimpsest-git-history-0.1.0.vsix`. Open your project, then run **Palimpsest: Open Git History**. Use **Palimpsest: Choose Repository…** or **Open** in the viewer to switch projects with a native folder picker. Use **Palimpsest: Refresh Git History** after new commits.
+In VS Code, run **Extensions: Install from VSIX…** and choose `releases/palimpsest-git-history-0.2.0.vsix`. Open your project, then click **Palimpsest** in the Activity Bar or run **Palimpsest: Open Git Workbench**. Use **Open in New Window** for a separate native window, or **Open to the Side** to work beside your editor. **Changes** provides file diffs, staging, commits, branch creation/switching, fetch, fast-forward pull, and push. Use **Palimpsest: Choose Repository…** or **Open** in the viewer to switch projects with a native folder picker.
 
-The installed extension requires VS Code 1.95+ and Git on the workspace host; it does not require a separate Node installation or web server. It runs Git in an isolated, lazily started worker with a bounded request queue. The worker is released 30 seconds after hiding the view and immediately after closing it. The selected repository, branch scope, and timeline position survive hiding and restoration. Packaged installers are available from [GitHub Releases](https://github.com/wenhaoquestion/palimpsest-git-history/releases).
+The installed extension requires VS Code 1.95+ and Git on the workspace host; it does not require a separate Node installation or web server. It runs Git in an isolated, lazily started worker with a bounded request queue. The worker is released 30 seconds after hiding the view, or on closing it, after running writes finish. The selected repository, branch scope, timeline position, active page, and commit draft survive hiding and restoration. Packaged installers are available from [GitHub Releases](https://github.com/wenhaoquestion/palimpsest-git-history/releases).
 
-Ordinary repositories, linked worktrees, bare repositories, and empty repositories are supported. The extension is configured to run on the workspace host in Remote SSH, WSL, and Dev Containers. Local macOS use has been tested in VS Code 1.136.1; Windows and remote hosts have not been exercised here. See [extension usage and settings](extension/README.md). The publisher identifier is `wenhaoquestion`; the Marketplace listing becomes available after publisher registration and publication.
+Ordinary repositories, linked worktrees, bare repositories, and empty repositories are supported; working changes require a working tree. The extension is configured to run on the workspace host in Remote SSH, WSL, and Dev Containers. Local macOS use has been tested in VS Code 1.136.1; Windows and remote hosts have not been exercised here. See [extension usage and settings](extension/README.md) and the [Marketplace listing](https://marketplace.visualstudio.com/items?itemName=wenhaoquestion.palimpsest-git-history). The public publisher is `wenhao_question`, with technical identifier `wenhaoquestion`.
 
 ## Linux history website
 
@@ -34,7 +34,7 @@ npm run dev
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173), choose **Open** in the header, and paste a local repository's absolute folder path. The repository name is also a shortcut to the picker. Switch projects without restarting the server. Normal checkouts, linked worktrees, bare repositories, and folders inside a checkout are supported. Empty repositories show an explanation until their first commit.
 
-To inspect a remote project, clone it with Git first and open the resulting local folder. The viewer does not modify the selected repository. One server has one active repository shared across its browser tabs; reload another tab after switching projects.
+To inspect a remote project, clone it with Git first and open the resulting local folder. History browsing is read-only; the **Changes** page performs only the Git operations you invoke. One server has one active repository shared across its browser tabs; reload another tab after switching projects.
 
 An optional environment variable selects the initial repository:
 
@@ -106,6 +106,8 @@ The complete memory workload takes 8.3 seconds before and 9.3 seconds after; con
 In a Chromium test, a 60-point drag triggered zero API reads while held and one destination history-page read after release; the snapshot settled in 234 ms, with no observed long tasks. In the actual VS Code webview, a 50-point drag had an 8.4 ms frame-interval p95 on the test display and loaded destination metadata 401 ms after release. Hiding and restoring the panel preserved its selected commit.
 
 The complete Linux repository was also measured offline: indexing 1,482,108 commits took 18.06 seconds, random 128-commit pages took 29.9–31.4 ms, and landscapes took 390–869 ms. After this workload and garbage collection, the measured Node backend retained 13.7 MiB of heap and 125.3 MiB RSS, excluding Git subprocesses. The installed extension also opened this full repository in the user's local VS Code and navigated to its final commit.
+
+Version 0.2 caches the visible scene during panning, continuous zooming, and commit transitions. Hover draws a separate overlay. On three real Linux snapshots at 1100×850 / DPR 2 in Chromium without CPU throttling, panning frame-interval p95 improved from 27.8 to 9.2 ms and zooming from 32.5 to 9.6 ms; painting JavaScript p95 dropped from 3.9/5.1 ms to 0.2/0.3 ms. Those interaction runs had no tasks over 50 ms. A new commit's initial scene rasterization still costs about 39 ms before its cached transition. Each canvas is limited to 4,194,304 pixels and 4096 pixels per side; the display and two caches allow at most 48 MiB of RGBA pixels, excluding browser/GPU overhead. Hidden and unmounted views release their caches.
 
 These are local measurements, not a claim about every repository or display. Initial indexing depends on Git graph traversal and disk speed. C++ was not added: removing unnecessary diff computation and retained buffers addressed the measured bottlenecks, while Git already performs repository operations natively.
 

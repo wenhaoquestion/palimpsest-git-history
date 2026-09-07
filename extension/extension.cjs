@@ -7,9 +7,13 @@ const { pathToFileURL } = require('node:url')
 const VIEW_TYPE = 'palimpsest.history'
 const SAVED_REPOSITORY = 'palimpsest.repositoryPath'
 const MAX_REQUESTS = 16
+const LAUNCHER_VIEW = 'palimpsest.launcher'
+const NEW_WINDOW_COMMAND = 'workbench.action.moveEditorToNewWindow'
+const MUTATION_PATHS = new Set(['stage', 'unstage', 'commit', 'branch', 'checkout', 'fetch', 'pull', 'push'].map((name) => `/api/workspace/${name}`))
 let currentPanel
 let rpcModule
 let commandQueue = Promise.resolve()
+const retiringPanels = new Set()
 
 function trusted() {
   if (vscode.workspace.isTrusted) return true
@@ -125,6 +129,8 @@ class HistoryPanel {
     this.disposed = false
     this.switching = false
     this.idleTimer = null
+    this.webviewReady = false
+    this.requestedSurface = undefined
     this.panel = panel ?? vscode.window.createWebviewPanel(VIEW_TYPE, 'Palimpsest', vscode.ViewColumn.Active, {})
     this.lastVisible = this.panel.visible
     this.panel.webview.options = {
@@ -135,7 +141,11 @@ class HistoryPanel {
     this.disposables = [
       this.panel.webview.onDidReceiveMessage((message) => { void this.receive(message) }),
       this.panel.onDidChangeViewState(() => this.visibilityChanged()),
-      this.panel.onDidDispose(() => { void this.dispose() }),
+      this.panel.onDidDispose(() => {
+        const retired = this.dispose()
+        retiringPanels.add(retired)
+        void retired.finally(() => retiringPanels.delete(retired))
+      }),
     ]
   }
 
@@ -149,12 +159,36 @@ class HistoryPanel {
     if (!this.disposed) void Promise.resolve(this.panel.webview.postMessage(message)).catch(() => undefined)
   }
 
-  cancelRequests() {
-    for (const controller of this.pending.values()) controller.abort()
-    this.pending.clear()
+  showWorkspace() {
+    this.requestedSurface = 'workspace'
+    this.deliverSurface()
   }
 
-  async releaseWorker() {
+  deliverSurface() {
+    if (this.webviewReady && this.requestedSurface === 'workspace') {
+      this.post({ type: 'palimpsest:showWorkspace' })
+      this.requestedSurface = undefined
+    }
+  }
+
+  cancelRequests({ preserveMutations = false } = {}) {
+    for (const [id, controller] of this.pending) {
+      if (preserveMutations && controller.mutation) continue
+      controller.abort()
+      this.pending.delete(id)
+    }
+  }
+
+  async waitForMutations() {
+    await Promise.all([...this.pending.values()].filter((controller) => controller.mutation).map((controller) => controller.completion))
+  }
+
+  async releaseWorker({ onlyIfHidden = false } = {}) {
+    // A view becoming hidden or closing cannot undo a commit or remote write.
+    // Keep its worker alive until the already submitted operation settles.
+    this.cancelRequests({ preserveMutations: true })
+    await this.waitForMutations()
+    if (onlyIfHidden && this.panel.visible && !this.disposed) return
     this.generation += 1
     this.recoveredRepositoryId = undefined
     this.cancelRequests()
@@ -180,8 +214,18 @@ class HistoryPanel {
 
   async receive(message) {
     if (!message || typeof message !== 'object' || this.disposed) return
+    if (message.type === 'palimpsest:ready') {
+      this.webviewReady = true
+      this.deliverSurface()
+      return
+    }
     if (message.type === 'palimpsest:cancel') {
-      this.pending.get(message.id)?.abort()
+      const controller = this.pending.get(message.id)
+      if (!controller?.mutation) controller?.abort()
+      return
+    }
+    if (message.type === 'palimpsest:openInNewWindow' || message.type === 'palimpsest:openToSide') {
+      await vscode.commands.executeCommand(message.type === 'palimpsest:openInNewWindow' ? 'palimpsest.openInNewWindow' : 'palimpsest.openToSide')
       return
     }
     if (message.type === 'palimpsest:pickRepository') {
@@ -198,17 +242,29 @@ class HistoryPanel {
       || (message.body !== undefined && (typeof message.body !== 'string' || message.body.length > 65536))) {
       return reply(400, { message: 'Invalid history request.' })
     }
+    const requestPath = new URL(message.url, 'http://localhost').pathname
+    const mutation = message.method === 'POST' && MUTATION_PATHS.has(requestPath)
+    if (message.method === 'POST' && !mutation && requestPath !== '/api/refresh') {
+      return reply(405, { message: 'Use the native repository picker or a supported Git workbench action.' })
+    }
+    if (message.method === 'POST' && [...this.pending.values()].some((controller) => controller.mutation)) {
+      return reply(409, { message: 'A Git operation is already running. Wait for it to finish.' })
+    }
     if (this.pending.has(message.id) || this.pending.size >= MAX_REQUESTS) {
       return reply(429, { message: 'Too many pending history requests. Try again shortly.' })
     }
     const controller = new AbortController()
+    controller.mutation = mutation
+    let completeMutation
+    if (mutation) controller.completion = new Promise((resolve) => { completeMutation = resolve })
     const generation = this.generation
     this.pending.set(message.id, controller)
     try {
       const client = await this.ensureClient(generation)
       const result = await client.request({ url: message.url, method: message.method ?? 'GET', body: message.body }, controller.signal)
       if (!controller.signal.aborted && generation === this.generation) {
-        if (result.status === 409 && result.body?.error?.code === 'REPOSITORY_CHANGED') {
+        const otherMutationRunning = [...this.pending.values()].some((pending) => pending.mutation && pending !== controller)
+        if (result.status === 409 && result.body?.error?.code === 'REPOSITORY_CHANGED' && !otherMutationRunning) {
           const staleId = new URL(message.url, 'http://localhost').searchParams.get('repository')
           if (staleId !== this.recoveredRepositoryId) {
             this.recoveredRepositoryId = staleId
@@ -234,6 +290,7 @@ class HistoryPanel {
       }
     } finally {
       if (this.pending.get(message.id) === controller) this.pending.delete(message.id)
+      completeMutation?.()
     }
   }
 
@@ -249,24 +306,29 @@ class HistoryPanel {
       this.post({ type: 'palimpsest:repositoryChanged', repoPath: this.repoPath })
       return
     }
-    this.cancelRequests()
+    this.webviewReady = false
+    this.cancelRequests({ preserveMutations: true })
     const seconds = vscode.workspace.getConfiguration('palimpsest').get('workerIdleSeconds', 30)
-    this.idleTimer = setTimeout(() => { void this.releaseWorker() }, Math.max(0, seconds) * 1000)
+    this.idleTimer = setTimeout(() => { void this.releaseWorker({ onlyIfHidden: true }) }, Math.max(0, seconds) * 1000)
     this.idleTimer.unref?.()
   }
 
   async changeRepository(repoPath) {
-    if (!rpcModule) rpcModule = import(pathToFileURL(path.join(this.context.extensionPath, 'server', 'rpc-client.mjs')).href)
-    const { createRpcClient } = await rpcModule
     if (this.disposed || !vscode.workspace.isTrusted) return
-    const candidate = createRpcClient({
-      repoPath,
-      maxHeapMb: vscode.workspace.getConfiguration('palimpsest').get('workerMaxHeapMb', 384),
-    })
+    this.switching = true
+    let candidate
     const validationKey = Symbol('repository-validation')
     const controller = new AbortController()
-    this.pending.set(validationKey, controller)
     try {
+      await this.waitForMutations()
+      if (this.disposed || !vscode.workspace.isTrusted) return
+      if (!rpcModule) rpcModule = import(pathToFileURL(path.join(this.context.extensionPath, 'server', 'rpc-client.mjs')).href)
+      const { createRpcClient } = await rpcModule
+      candidate = createRpcClient({
+        repoPath,
+        maxHeapMb: vscode.workspace.getConfiguration('palimpsest').get('workerMaxHeapMb', 384),
+      })
+      this.pending.set(validationKey, controller)
       const result = await candidate.request({ url: '/api/repository?stats=false', method: 'GET' }, controller.signal)
       if (result.status >= 400 || !['ready', 'empty'].includes(result.body?.status)) {
         throw new Error(result.body?.message ?? 'This folder could not be opened as a Git repository.')
@@ -281,7 +343,7 @@ class HistoryPanel {
       this.client = candidate
       this.repoPath = repoPath
     } catch (error) {
-      await candidate.dispose()
+      await candidate?.dispose()
       if (error.name !== 'AbortError') throw error
       return
     } finally {
@@ -305,6 +367,46 @@ class HistoryPanel {
   }
 }
 
+async function focusHistoryPanel(view) {
+  if (view.disposed) return false
+  if (view.panel.active) {
+    view.panel.reveal(undefined, false)
+    return true
+  }
+  return new Promise((resolve) => {
+    let timer
+    let subscription
+    const finish = (focused) => { clearTimeout(timer); subscription?.dispose(); resolve(focused) }
+    subscription = view.panel.onDidChangeViewState(() => {
+      if (view.panel.active) finish(true)
+    })
+    timer = setTimeout(() => finish(false), 1500)
+    view.panel.reveal(undefined, false)
+    if (view.panel.active) finish(true)
+  })
+}
+
+async function openFloatingWindow(view) {
+  if (!view || view.disposed) return
+  const commands = await vscode.commands.getCommands(true).catch(() => [])
+  if (commands.includes(NEW_WINDOW_COMMAND) && await focusHistoryPanel(view)) {
+    if (view.disposed || currentPanel !== view) return
+    const wasReady = view.webviewReady
+    try {
+      // VS Code reloads webview content when moving it across native windows.
+      view.webviewReady = false
+      await vscode.commands.executeCommand(NEW_WINDOW_COMMAND)
+      return
+    } catch {
+      view.webviewReady = wasReady
+      view.deliverSurface()
+    }
+  }
+  if (view.disposed) return
+  view.panel.reveal(vscode.ViewColumn.Beside, false)
+  await vscode.window.showInformationMessage('This VS Code host could not open a floating window. Palimpsest is open beside your editor; its tab can also be dragged to another editor group.')
+}
+
 function activate(context) {
   const run = (operation) => {
     commandQueue = commandQueue.then(async () => {
@@ -313,16 +415,27 @@ function activate(context) {
     return commandQueue
   }
   const open = async (forcePicker = false, resource) => {
-    if (currentPanel && !forcePicker) return currentPanel.panel.reveal()
+    if (currentPanel && !forcePicker) {
+      currentPanel.panel.reveal()
+      return currentPanel
+    }
     const repoPath = await pickRepository(context, forcePicker, resource)
     if (!repoPath || !vscode.workspace.isTrusted) return
-    if (currentPanel) return currentPanel.changeRepository(repoPath)
+    if (currentPanel) {
+      await currentPanel.changeRepository(repoPath)
+      return currentPanel
+    }
     const view = new HistoryPanel(context, repoPath)
     currentPanel = view
     try { await view.initialize() } catch (error) { view.panel.dispose(); throw error }
+    return view
   }
   context.subscriptions.push(
+    vscode.window.registerTreeDataProvider(LAUNCHER_VIEW, { getTreeItem: (item) => item, getChildren: () => [] }),
     vscode.commands.registerCommand('palimpsest.open', () => run(() => open())),
+    vscode.commands.registerCommand('palimpsest.openChanges', () => run(async () => { (await open())?.showWorkspace() })),
+    vscode.commands.registerCommand('palimpsest.openInNewWindow', () => run(async () => { await openFloatingWindow(await open()) })),
+    vscode.commands.registerCommand('palimpsest.openToSide', () => run(async () => { (await open())?.panel.reveal(vscode.ViewColumn.Beside, false) })),
     vscode.commands.registerCommand('palimpsest.openRepository', (resource) => run(() => open(true, resource))),
     vscode.commands.registerCommand('palimpsest.refresh', () => run(async () => {
       if (!currentPanel) return open()
@@ -343,7 +456,7 @@ function activate(context) {
 }
 
 async function deactivate() {
-  await currentPanel?.dispose()
+  await Promise.all([currentPanel?.dispose(), ...retiringPanels])
 }
 
 module.exports = { activate, deactivate }

@@ -86,6 +86,25 @@ const MIN_ZOOM = 0.14
 const MAX_ZOOM = 4.8
 const MOTION_DURATION = 420
 const RAPID_LAYOUT_WINDOW = 180
+const ZOOM_SETTLE_DELAY = 100
+// A viewport-sized raster avoids replaying thousands of Canvas commands on
+// every pointer frame. Two surfaces (only during a commit dissolve) use at
+// most 32 MiB of RGBA pixels, independent of repository size and world zoom.
+const MAX_SCENE_PIXELS = 4 * 1024 * 1024
+const MAX_SCENE_DIMENSION = 4096
+const SCENE_OVERSCAN = 144
+
+interface SceneRaster {
+  canvas: HTMLCanvasElement
+  camera: Camera
+  size: CanvasSize
+  viewport: CanvasSize
+  layout: RepositoryLayout
+  focusMode: RepositoryCanvasProps['focusMode']
+  selectedPath: string | null
+  selectedDirectory: string | null
+  regions: HitRegion[]
+}
 const FONT_STACK = 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
 
 const rootStyle: CSSProperties = {
@@ -188,6 +207,10 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
   const frameRef = useRef<number | null>(null)
   const drawRef = useRef<(time: number) => boolean>(() => false)
   const hitRegionsRef = useRef<HitRegion[]>([])
+  const hitCameraRef = useRef<Camera>(cameraRef.current)
+  const rasterRef = useRef<SceneRaster | null>(null)
+  const previousRasterRef = useRef<SceneRaster | null>(null)
+  const zoomSettlingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hoverRef = useRef<HitRegion | null>(null)
   const dragRef = useRef<DragState | null>(null)
   const continuityLayoutRef = useRef<RepositoryLayout | null>(null)
@@ -222,7 +245,7 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
   }, [layout])
 
   const scheduleDraw = useCallback(() => {
-    if (frameRef.current !== null) return
+    if (frameRef.current !== null || document.hidden) return
     frameRef.current = window.requestAnimationFrame((time) => {
       frameRef.current = null
       if (drawRef.current(time)) scheduleDraw()
@@ -233,7 +256,7 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
     (time: number): boolean => {
       const canvas = canvasRef.current
       if (!canvas) return false
-      const context = canvas.getContext('2d')
+      const context = canvas.getContext('2d', { alpha: false })
       const size = sizeRef.current
       if (!context || size.width <= 0 || size.height <= 0) return false
       const activeLayout = layoutRef.current
@@ -257,22 +280,82 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
         ? clamp01((time - transition.start) / transition.duration)
         : 1
 
-      context.setTransform(size.dpr, 0, 0, size.dpr, 0, 0)
-      context.clearRect(0, 0, size.width, size.height)
-      hitRegionsRef.current = paintRepositoryScene(context, {
-        layout: activeLayout,
-        size,
-        camera: cameraRef.current,
-        focusMode,
-        selectedPath,
-        selectedDirectory,
-        hovered: hoverRef.current,
-        changeProgress,
-        reducedMotion,
-        showEmpty: activeLayout.sourceFileCount === 0,
-      })
+      const camera = cameraRef.current
+      const hovered = hoverRef.current
+      let raster = rasterRef.current
+      const sceneChanged = !raster || raster.layout !== activeLayout
+        || raster.focusMode !== focusMode || raster.selectedPath !== selectedPath
+        || raster.selectedDirectory !== selectedDirectory
+        || raster.viewport.width !== size.width || raster.viewport.height !== size.height
+        || raster.viewport.dpr !== size.dpr
+      const zoomPreview = zoomSettlingRef.current !== null || cameraMoving
+      const needsRaster = sceneChanged || !raster
+        || (!zoomPreview && (raster.camera.zoom !== camera.zoom || !rasterCoversViewport(raster, camera, size)))
 
-      return cameraMoving || changeProgress < 1
+      if (needsRaster) {
+        releaseRaster(previousRasterRef.current)
+        previousRasterRef.current = null
+        const next = createSceneRaster({
+          layout: activeLayout,
+          size,
+          camera,
+          focusMode,
+          selectedPath,
+          selectedDirectory,
+          hovered: null,
+          // Geometry is rasterized once at its final size. The cached old and
+          // new snapshots dissolve below, so motion no longer repaints every
+          // directory, facade, label, and hit polygon for 420 ms.
+          showEmpty: activeLayout.sourceFileCount === 0,
+        })
+        if (next) {
+          if (raster && raster.layout !== activeLayout && changeProgress < 1 && !reducedMotion) {
+            releaseRaster(previousRasterRef.current)
+            previousRasterRef.current = raster
+          } else {
+            releaseRaster(raster)
+          }
+          rasterRef.current = next
+          raster = next
+        } else {
+          releaseRaster(raster)
+          rasterRef.current = null
+          raster = null
+        }
+      }
+
+      context.setTransform(size.dpr, 0, 0, size.dpr, 0, 0)
+      context.fillStyle = '#0e100f'
+      context.fillRect(0, 0, size.width, size.height)
+      if (raster) {
+        const previous = previousRasterRef.current
+        if (previous && changeProgress < 1) {
+          compositeRaster(context, previous, camera)
+          context.globalAlpha = easeOutCubic(changeProgress)
+        }
+        compositeRaster(context, raster, camera)
+        context.globalAlpha = 1
+        hitRegionsRef.current = raster.regions
+        hitCameraRef.current = raster.camera
+        drawScaleMark(context, size, camera.zoom, activeLayout)
+      } else {
+        // If the browser cannot allocate an offscreen surface, keep the view
+        // functional using the bounded vector scene on the visible canvas.
+        hitRegionsRef.current = paintRepositoryScene(context, {
+          layout: activeLayout, size, camera, focusMode, selectedPath,
+          selectedDirectory, hovered: null,
+          showEmpty: activeLayout.sourceFileCount === 0,
+        })
+        hitCameraRef.current = { ...camera }
+        drawScaleMark(context, size, camera.zoom, activeLayout)
+      }
+      if (hovered) drawHoverAccent(context, activeLayout, camera, hovered, focusMode, selectedPath, selectedDirectory)
+      if (changeProgress >= 1) {
+        releaseRaster(previousRasterRef.current)
+        previousRasterRef.current = null
+      }
+
+      return cameraMoving || (previousRasterRef.current !== null && changeProgress < 1)
     },
     [focusMode, layout, reducedMotion, selectedDirectory, selectedPath],
   )
@@ -290,7 +373,12 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
       const height = Math.max(1, Math.round(rect.height))
       const nativeDpr = window.devicePixelRatio || 1
       const pixelBudget = width * height > 1_050_000 ? 1.45 : 1.75
-      const dpr = Math.min(pixelBudget, nativeDpr)
+      const dpr = Math.min(
+        pixelBudget, nativeDpr,
+        Math.sqrt(MAX_SCENE_PIXELS / (width * height)),
+        MAX_SCENE_DIMENSION / width,
+        MAX_SCENE_DIMENSION / height,
+      )
       const previous = sizeRef.current
       if (previous.width === width && previous.height === height && previous.dpr === dpr) return
       sizeRef.current = { width, height, dpr }
@@ -322,15 +410,14 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
     return () => observer.disconnect()
   }, [focusMode, scheduleDraw])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const now = performance.now()
     const rapidSequence = now - lastTransitionAtRef.current < RAPID_LAYOUT_WINDOW
     lastTransitionAtRef.current = now
     transitionRef.current = {
       start: now,
-      // During a live scrub, restarting a growth animation on every sample
-      // reads as flicker. Render those rapid samples immediately while keeping
-      // the explanatory animation for deliberate step/playback changes.
+      // Rapid steps settle immediately instead of restarting a dissolve.
+      // Deliberate step/playback changes keep the brief visual transition.
       duration: reducedMotion || rapidSequence ? 0 : MOTION_DURATION,
     }
     scheduleDraw()
@@ -377,6 +464,11 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
     if (!canvas) return
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault()
+      if (zoomSettlingRef.current !== null) clearTimeout(zoomSettlingRef.current)
+      zoomSettlingRef.current = setTimeout(() => {
+        zoomSettlingRef.current = null
+        scheduleDraw()
+      }, ZOOM_SETTLE_DELAY)
       const rect = canvas.getBoundingClientRect()
       const x = event.clientX - rect.left
       const y = event.clientY - rect.top
@@ -396,15 +488,28 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
     return () => canvas.removeEventListener('wheel', handleWheel)
   }, [scheduleDraw])
 
-  useEffect(
-    () => () => {
-      if (frameRef.current !== null) {
-        window.cancelAnimationFrame(frameRef.current)
-        frameRef.current = null
-      }
-    },
-    [],
-  )
+  useEffect(() => {
+    const releaseSurfaces = () => {
+      if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current)
+      frameRef.current = null
+      if (zoomSettlingRef.current !== null) clearTimeout(zoomSettlingRef.current)
+      zoomSettlingRef.current = null
+      releaseRaster(rasterRef.current)
+      releaseRaster(previousRasterRef.current)
+      rasterRef.current = null
+      previousRasterRef.current = null
+      hitRegionsRef.current = []
+    }
+    const handleVisibility = () => {
+      if (document.hidden) releaseSurfaces()
+      else scheduleDraw()
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility)
+      releaseSurfaces()
+    }
+  }, [scheduleDraw])
 
   const updateHover = useCallback(
     (region: HitRegion | null, x: number, y: number) => {
@@ -462,7 +567,7 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
         return
       }
 
-      updateHover(hitTest(hitRegionsRef.current, x, y), x, y)
+      updateHover(hitTestAtCamera(hitRegionsRef.current, x, y, cameraRef.current, hitCameraRef.current), x, y)
     },
     [scheduleDraw, updateHover],
   )
@@ -478,7 +583,7 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
       const rect = event.currentTarget.getBoundingClientRect()
       const x = event.clientX - rect.left
       const y = event.clientY - rect.top
-      const hit = hitTest(hitRegionsRef.current, x, y)
+      const hit = hitTestAtCamera(hitRegionsRef.current, x, y, cameraRef.current, hitCameraRef.current)
       event.currentTarget.style.cursor = hit ? 'pointer' : 'grab'
       if (!drag.moved && hit) {
         if (hit.kind === 'file') onSelectFile(hit.path)
@@ -700,8 +805,6 @@ interface SceneOptions {
   selectedPath: string | null
   selectedDirectory: string | null
   hovered: HitRegion | null
-  changeProgress: number
-  reducedMotion: boolean
   showEmpty: boolean
 }
 
@@ -746,7 +849,7 @@ function paintRepositoryScene(context: CanvasRenderingContext2D, options: SceneO
   }
 
   drawDistrictRoads(context, layout, camera, focusTopLevel)
-  drawTraces(context, layout, camera, options.changeProgress)
+  drawTraces(context, layout, camera)
 
   for (const block of layout.blocks) {
     if (!shouldDrawBlock(block, camera.zoom, options)
@@ -758,8 +861,71 @@ function paintRepositoryScene(context: CanvasRenderingContext2D, options: SceneO
 
   drawDirectoryLabels(context, orderedDirectories, camera, options)
   drawFileLabels(context, layout.blocks, camera, options)
-  drawScaleMark(context, size, camera.zoom, layout)
   return hitRegions
+}
+
+function createSceneRaster(options: SceneOptions): SceneRaster | null {
+  const viewport = options.size
+  const padding = Math.min(SCENE_OVERSCAN, Math.round(Math.min(viewport.width, viewport.height) * 0.2))
+  const width = viewport.width + padding * 2
+  const height = viewport.height + padding * 2
+  const dpr = Math.min(
+    viewport.dpr,
+    Math.sqrt(MAX_SCENE_PIXELS / (width * height)),
+    MAX_SCENE_DIMENSION / width,
+    MAX_SCENE_DIMENSION / height,
+  )
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.floor(width * dpr))
+  canvas.height = Math.max(1, Math.floor(height * dpr))
+  const context = canvas.getContext('2d', { alpha: false })
+  if (!context) {
+    canvas.width = canvas.height = 0
+    return null
+  }
+  const camera = {
+    zoom: options.camera.zoom,
+    offsetX: options.camera.offsetX + padding,
+    offsetY: options.camera.offsetY + padding,
+  }
+  const size = { width, height, dpr }
+  context.setTransform(dpr, 0, 0, dpr, 0, 0)
+  const regions = paintRepositoryScene(context, { ...options, size, camera })
+  return {
+    canvas, camera, size, viewport, layout: options.layout,
+    focusMode: options.focusMode, selectedPath: options.selectedPath,
+    selectedDirectory: options.selectedDirectory, regions,
+  }
+}
+
+function rasterCoversViewport(raster: SceneRaster, camera: Camera, size: CanvasSize): boolean {
+  const x = camera.offsetX - raster.camera.offsetX
+  const y = camera.offsetY - raster.camera.offsetY
+  return x <= 0 && y <= 0 && x + raster.size.width >= size.width && y + raster.size.height >= size.height
+}
+
+function compositeRaster(context: CanvasRenderingContext2D, raster: SceneRaster, camera: Camera): void {
+  const ratio = camera.zoom / raster.camera.zoom
+  context.drawImage(
+    raster.canvas,
+    camera.offsetX - raster.camera.offsetX * ratio,
+    camera.offsetY - raster.camera.offsetY * ratio,
+    raster.size.width * ratio,
+    raster.size.height * ratio,
+  )
+}
+
+function releaseRaster(raster: SceneRaster | null): void {
+  // Reset dimensions to promptly release the browser's pixel/GPU backing store.
+  if (raster) raster.canvas.width = raster.canvas.height = 0
+}
+
+function hitTestAtCamera(regions: HitRegion[], x: number, y: number, camera: Camera, rasterCamera: Camera): HitRegion | null {
+  const ratio = rasterCamera.zoom / camera.zoom
+  return hitTest(regions,
+    (x - camera.offsetX) * ratio + rasterCamera.offsetX,
+    (y - camera.offsetY) * ratio + rasterCamera.offsetY,
+  )
 }
 
 /** Conservative projected bounds; skip geometry wholly outside the viewport. */
@@ -805,22 +971,20 @@ function drawSurveyGrid(
   const startX = Math.floor(bounds.minX / step) * step
   const startY = Math.floor(bounds.minY / step) * step
 
+  context.beginPath()
   for (let x = startX; x <= bounds.maxX + step; x += step) {
     const from = toScreen(x, bounds.minY - step, 0, camera)
     const to = toScreen(x, bounds.maxY + step, 0, camera)
-    context.beginPath()
     context.moveTo(from.x, from.y)
     context.lineTo(to.x, to.y)
-    context.stroke()
   }
   for (let y = startY; y <= bounds.maxY + step; y += step) {
     const from = toScreen(bounds.minX - step, y, 0, camera)
     const to = toScreen(bounds.maxX + step, y, 0, camera)
-    context.beginPath()
     context.moveTo(from.x, from.y)
     context.lineTo(to.x, to.y)
-    context.stroke()
   }
+  context.stroke()
   context.restore()
 }
 
@@ -929,20 +1093,20 @@ function drawDistrictPlots(
   context.save()
   context.globalAlpha = muted ? 0.62 : 1
   context.fillStyle = withAlpha(statusColor, directory.changedFileCount > 0 ? 0.24 : 0.13)
+  context.beginPath()
   for (let index = 0; index < target; index += 1) {
     const column = index % columns
     const row = Math.floor(index / columns)
     const x = directory.x + paddingX + ((column + 0.5) / columns) * Math.max(1, directory.width - paddingX * 2)
     const y = directory.y + paddingY + ((row + 0.5) / rows) * Math.max(1, directory.depth - paddingY * 2)
     const point = toScreen(x, y, directory.elevation + 0.05, camera)
-    context.beginPath()
     context.moveTo(point.x, point.y - half)
     context.lineTo(point.x + half * 1.35, point.y)
     context.lineTo(point.x, point.y + half)
     context.lineTo(point.x - half * 1.35, point.y)
     context.closePath()
-    context.fill()
   }
+  context.fill()
   context.restore()
 }
 
@@ -1029,16 +1193,14 @@ function drawTraces(
   context: CanvasRenderingContext2D,
   layout: RepositoryLayout,
   camera: Camera,
-  progress: number,
 ): void {
   if (layout.traces.length === 0) return
-  const eased = easeOutCubic(progress)
   context.save()
   context.lineCap = 'round'
   for (const trace of layout.traces) {
     const from = toScreen(trace.from.x, trace.from.y, 4.2, camera)
     const to = toScreen(trace.to.x, trace.to.y, 4.2, camera)
-    const current = { x: lerp(from.x, to.x, eased), y: lerp(from.y, to.y, eased) }
+    const current = to
     const distance = Math.hypot(current.x - from.x, current.y - from.y)
     const lift = Math.min(54, Math.max(13, distance * 0.16))
     const control = {
@@ -1057,7 +1219,7 @@ function drawTraces(
     context.setLineDash(trace.kind === 'move' ? [] : [3, 6])
     context.stroke()
 
-    if (trace.kind === 'move' && progress > 0.72) {
+    if (trace.kind === 'move') {
       const angle = Math.atan2(current.y - control.y, current.x - control.x)
       const arrowSize = 4.5
       context.beginPath()
@@ -1082,10 +1244,7 @@ function drawFileBlock(
   const changed = block.status !== null
   const selected = block.path === options.selectedPath && !block.aggregate
   const hovered = options.hovered?.path === block.path && options.hovered?.kind !== 'directory'
-  const reveal = changed && (block.status === 'A' || block.status === 'R' || block.status === 'C')
-    ? 0.16 + easeOutCubic(options.changeProgress) * 0.84
-    : 1
-  const height = block.ghost ? Math.max(1.6, block.height * (1 - options.changeProgress * 0.28)) : block.height * reveal
+  const height = block.ghost ? Math.max(1.6, block.height * 0.72) : block.height
   const topColor = blockColor(block)
   const top = blockPolygon(block, block.baseElevation + height, camera)
   const ground = blockPolygon(block, block.baseElevation, camera)
@@ -1095,7 +1254,7 @@ function drawFileBlock(
 
   context.save()
   context.lineJoin = 'round'
-  context.globalAlpha = (block.ghost ? 0.62 : reveal) * (focusMuted ? 0.7 : 1)
+  context.globalAlpha = (block.ghost ? 0.62 : 1) * (focusMuted ? 0.7 : 1)
 
   if ((selected || hovered) && !block.ghost) {
     drawBlockBeacon(context, ground, block.status ? CHANGE_COLORS[block.status] : '#dfe4d9', selected)
@@ -1142,12 +1301,12 @@ function drawFileBlock(
       context.strokeStyle = 'rgba(236, 238, 230, 0.17)'
       context.lineWidth = 0.8
       const bounds = polygonBounds(top)
+      context.beginPath()
       for (let x = bounds.minX - 20; x < bounds.maxX + 20; x += 6) {
-        context.beginPath()
         context.moveTo(x, bounds.maxY + 8)
         context.lineTo(x + 28, bounds.minY - 8)
-        context.stroke()
       }
+      context.stroke()
       context.restore()
     } else if (camera.zoom > 0.46 && height * camera.zoom > 7) {
       drawFacadeRibs(context, front, topColor)
@@ -1164,14 +1323,6 @@ function drawFileBlock(
           : 'rgba(230, 233, 224, 0.13)'
     context.lineWidth = selected ? 2 : hovered ? 1.5 : changed ? 1.05 : 0.65
     context.stroke()
-
-    if (block.status === 'M' && options.changeProgress < 1 && !options.reducedMotion) {
-      context.beginPath()
-      tracePolygon(context, top)
-      context.strokeStyle = withAlpha(CHANGE_COLORS.M, (1 - options.changeProgress) * 0.62)
-      context.lineWidth = 1.5 + (1 - options.changeProgress) * 3
-      context.stroke()
-    }
 
     const showStatusGlyph = selected
       || hovered
@@ -1193,6 +1344,46 @@ function drawFileBlock(
     status: block.status,
     polygons: [top, right, front],
   }
+}
+
+/** Hover is an overlay: moving a pointer must never invalidate the scene raster. */
+function drawHoverAccent(
+  context: CanvasRenderingContext2D,
+  layout: RepositoryLayout,
+  camera: Camera,
+  hovered: HitRegion,
+  focusMode: RepositoryCanvasProps['focusMode'],
+  selectedPath: string | null,
+  selectedDirectory: string | null,
+): void {
+  if (hovered.kind === 'directory') {
+    const directory = layout.directories.find((candidate) => candidate.path === hovered.path)
+    if (!directory) return
+    context.save()
+    context.beginPath()
+    tracePolygon(context, directoryPolygon(directory, camera))
+    context.strokeStyle = 'rgba(200, 209, 198, 0.62)'
+    context.lineWidth = 1.2
+    context.stroke()
+    context.restore()
+    return
+  }
+  const block = layout.blocks.find((candidate) => hovered.kind === 'aggregate'
+    ? candidate.aggregate && candidate.directory === hovered.path
+    : !candidate.aggregate && candidate.path === hovered.path)
+  if (!block) return
+  context.save()
+  drawBlockBeacon(context, blockPolygon(block, block.baseElevation, camera), '#dfe4d9', false)
+  context.beginPath()
+  tracePolygon(context, blockPolygon(block, block.baseElevation + block.height, camera))
+  context.strokeStyle = 'rgba(236, 239, 229, 0.88)'
+  context.lineWidth = 1.5
+  context.stroke()
+  context.restore()
+  drawFileLabels(context, [block], camera, {
+    layout, camera, size: { width: 0, height: 0, dpr: 1 }, focusMode,
+    selectedPath, selectedDirectory, hovered: { ...hovered, path: block.path }, showEmpty: false,
+  })
 }
 
 function drawBlockBeacon(
@@ -1228,12 +1419,12 @@ function drawFacadeRibs(
   context.save()
   context.strokeStyle = withAlpha(lighten(color, 0.28), 0.18)
   context.lineWidth = 0.55
+  context.beginPath()
   for (const amount of [0.34, 0.67]) {
-    context.beginPath()
     context.moveTo(lerp(upperLeft.x, upperRight.x, amount), lerp(upperLeft.y, upperRight.y, amount))
     context.lineTo(lerp(lowerLeft.x, lowerRight.x, amount), lerp(lowerLeft.y, lowerRight.y, amount))
-    context.stroke()
   }
+  context.stroke()
   context.restore()
 }
 
@@ -1423,10 +1614,9 @@ function blockPolygon(block: FileBlock, height: number, camera: Camera): LayoutP
 }
 
 function toScreen(x: number, y: number, z: number, camera: Camera): LayoutPoint {
-  const point = projectIsometric(x, y, z)
   return {
-    x: point.x * camera.zoom + camera.offsetX,
-    y: point.y * camera.zoom + camera.offsetY,
+    x: (x - y) * ISO_X * camera.zoom + camera.offsetX,
+    y: ((x + y) * ISO_Y - z) * camera.zoom + camera.offsetY,
   }
 }
 

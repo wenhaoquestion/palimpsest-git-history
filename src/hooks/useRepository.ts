@@ -57,6 +57,7 @@ export function useRepository() {
   }, [load])
 
   const refresh = useCallback(() => load('refresh'), [load])
+  const reload = useCallback(() => load('initial'), [load])
   const openRepository = useCallback((path: string) => load('open', path), [load])
-  return { payload, loading, refreshing, error, refresh, openRepository, revision }
+  return { payload, loading, refreshing, error, refresh, reload, openRepository, revision }
 }

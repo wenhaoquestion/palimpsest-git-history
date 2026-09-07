@@ -129,7 +129,7 @@ function assertSameOrigin(request) {
   }
 }
 
-async function readRepositoryPath(request) {
+async function readJsonBody(request) {
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] || '')) {
     request.resume()
     throw new GitServiceError('The repository request must use application/json.', {
@@ -177,6 +177,11 @@ async function readRepositoryPath(request) {
   } catch {
     throw new GitServiceError('The repository request must contain valid JSON.', { code: 'INVALID_JSON', status: 400 })
   }
+  return payload
+}
+
+async function readRepositoryPath(request) {
+  const payload = await readJsonBody(request)
   if (!payload || Array.isArray(payload) || typeof payload.path !== 'string'
     || !payload.path.trim() || payload.path.includes('\0')) {
     throw new GitServiceError('Provide a local Git repository directory in the path field.', {
@@ -272,7 +277,8 @@ export function createApiMiddleware({
     return (async () => {
       const method = (request.method || 'GET').toUpperCase()
       const readMethod = method === 'GET' || method === 'HEAD'
-      if (readOnly && (!readMethod || url.pathname === '/api/refresh')) {
+      if (readOnly && (!readMethod || url.pathname === '/api/refresh'
+        || url.pathname === '/api/workspace' || url.pathname.startsWith('/api/workspace/'))) {
         request.resume?.()
         response.setHeader('Allow', 'GET, HEAD')
         throw new GitServiceError('This public history viewer is read-only.', { code: 'READ_ONLY', status: 405 })
@@ -323,6 +329,32 @@ export function createApiMiddleware({
       const statsOptions = readOnly || url.searchParams.get('stats') === 'false' ? { includeStats: false } : undefined
       session.requests += 1
       try {
+        if (url.pathname === '/api/workspace' && readMethod) {
+          writeJson(response, 200, await gitService.getWorkspace(), method)
+          return
+        }
+
+        if (url.pathname === '/api/workspace/diff' && readMethod) {
+          const staged = url.searchParams.get('staged') ?? 'false'
+          if (!['true', 'false'].includes(staged)) {
+            throw new GitServiceError('The staged parameter must be true or false.', { code: 'INVALID_STAGED', status: 400 })
+          }
+          writeJson(response, 200, await gitService.getWorkspaceDiff(url.searchParams.get('path'), { staged: staged === 'true' }), method)
+          return
+        }
+
+        const workspaceAction = /^\/api\/workspace\/(stage|unstage|commit|branch|checkout|fetch|pull|push)$/.exec(url.pathname)
+        if (workspaceAction && method === 'POST') {
+          assertSameOrigin(request)
+          const options = await readJsonBody(request)
+          if (session !== active || (requestedRepository !== null && requestedRepository !== session.id)) throw repositoryChanged()
+          const payload = await gitService.mutateWorkspace(workspaceAction[1], options)
+          if (session !== active) throw repositoryChanged()
+          if (payload.repositoryChanged) session.id = randomUUID()
+          writeJson(response, 200, { ...payload, repositoryId: session.id }, method)
+          return
+        }
+
         if (url.pathname === '/api/repository' && readMethod) {
           const payload = await gitService.getRepository(statsOptions)
           const visiblePayload = !publicRepository ? payload : payload.status === 'ready'
@@ -415,6 +447,9 @@ export function createApiMiddleware({
           || url.pathname === '/api/refresh'
           || url.pathname === '/api/commits'
           || url.pathname === '/api/commit-index'
+          || url.pathname === '/api/workspace'
+          || url.pathname === '/api/workspace/diff'
+          || workspaceAction
           || commitMatch
           || treeMatch
           || changesMatch

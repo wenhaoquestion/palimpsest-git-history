@@ -8,6 +8,8 @@ export interface SavedView {
   repoPath: string
   scope: string
   index: number
+  surface?: 'history' | 'workspace'
+  workbench?: { repoPath: string; message: string }
 }
 
 declare global {
@@ -23,10 +25,21 @@ export function readSavedView(): SavedView | undefined {
   return saved && typeof saved.repoPath === 'string' && typeof saved.scope === 'string'
     && Number.isSafeInteger(saved.index) && saved.index >= 0 ? saved : undefined
 }
-export const saveView = (view: SavedView) => host?.setState(view)
+export const saveView = (view: SavedView) => host?.setState({ ...host.getState(), ...view })
 export const pickRepository = () => host?.postMessage({ type: 'palimpsest:pickRepository' })
+export const openInNewWindow = () => host?.postMessage({ type: 'palimpsest:openInNewWindow' })
+export const signalHostReady = () => host?.postMessage({ type: 'palimpsest:ready' })
+export const readSavedSurface = () => host?.getState()?.surface === 'workspace' ? 'workspace' : 'history'
+export const readSavedWorkbench = () => host?.getState()?.workbench
+export const saveSurface = (surface: 'history' | 'workspace') => host?.setState({
+  repoPath: '', scope: 'HEAD', index: 0, ...host.getState(), surface,
+})
+export const saveWorkbench = (workbench: { repoPath: string; message: string }) => host?.setState({
+  repoPath: '', scope: 'HEAD', index: 0, ...host.getState(), workbench,
+})
 
 interface PendingRequest {
+  mutation: boolean
   resolve: (response: { status: number; body: unknown }) => void
   reject: (error: Error) => void
   cleanup: () => void
@@ -41,11 +54,12 @@ if (host) {
     const message = event.data as { type?: string; id?: string; status?: number; body?: unknown; visible?: boolean }
     if (message?.type === 'palimpsest:visibility' && !message.visible) {
       for (const [id, request] of pending) {
+        if (request.mutation) continue
+        pending.delete(id)
         request.cleanup()
         host.postMessage({ type: 'palimpsest:cancel', id })
         request.reject(new DOMException('The history view is hidden.', 'AbortError'))
       }
-      pending.clear()
       return
     }
     if (message?.type !== 'palimpsest:response' || typeof message.id !== 'string') return
@@ -81,7 +95,9 @@ export function hostRequest(url: string, init?: RequestInit): Promise<{ status: 
       window.clearTimeout(timer)
       init?.signal?.removeEventListener('abort', cancel)
     }
-    pending.set(id, { resolve, reject, cleanup })
+    pending.set(id, { resolve, reject, cleanup,
+      mutation: init?.method === 'POST' && /^\/api\/workspace\/(stage|unstage|commit|branch|checkout|fetch|pull|push)(?:\?|$)/.test(url),
+    })
     init?.signal?.addEventListener('abort', cancel, { once: true })
     host.postMessage({ type: 'palimpsest:request', id, url, method: init?.method ?? 'GET', body: init?.body })
   })

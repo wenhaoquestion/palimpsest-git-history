@@ -20,6 +20,7 @@ import { Inspector, type InspectorTab } from './components/Inspector'
 import { PlaybackBar, type TimelineTick } from './components/PlaybackBar'
 import { RepositoryCanvas } from './components/RepositoryCanvas'
 import { RepositoryPicker } from './components/RepositoryPicker'
+import { GitWorkbench } from './components/GitWorkbench'
 import {
   EmptyInspector,
   LoadingRepository,
@@ -36,7 +37,7 @@ import {
 import { useCommitTimeline } from './hooks/useCommitTimeline'
 import { useReducedMotion } from './hooks/useReducedMotion'
 import { useRepository } from './hooks/useRepository'
-import { isVSCode, pickRepository, readSavedView, saveView } from './lib/host'
+import { isVSCode, pickRepository, readSavedView, saveView, readSavedSurface, saveSurface, signalHostReady } from './lib/host'
 import type { CommitSummary, RepositoryPayload, TreeFile } from './types/git'
 
 const PLAYBACK_INTERVAL = 1500
@@ -130,6 +131,7 @@ interface InactiveShellProps {
   onOpenHelp: (kind: 'help' | 'setup') => void
   onCloseHelp: () => void
   onOpenRepository: () => void
+  onOpenWorkspace: () => void
 }
 
 function InactiveShell({
@@ -144,6 +146,7 @@ function InactiveShell({
   onOpenHelp,
   onCloseHelp,
   onOpenRepository,
+  onOpenWorkspace,
 }: InactiveShellProps) {
   const fallbackName = payload?.repoName ?? (isLinuxHistorySite ? 'torvalds/linux' : 'Local repository')
   const displayPath = payload?.displayPath ?? 'Current working directory'
@@ -160,6 +163,7 @@ function InactiveShell({
         onSetMode={onSetMode}
         onOpenHelp={() => onOpenHelp('help')}
         onOpenRepository={onOpenRepository}
+        onOpenWorkspace={onOpenWorkspace}
       />
       <div className="workspace">
         <div className="commit-column"><EmptyCommitRail /></div>
@@ -201,12 +205,39 @@ function InactiveShell({
 export function App() {
   const repository = useRepository()
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [surface, setSurface] = useState<'history' | 'workspace'>(() => isLinuxHistorySite ? 'history' : readSavedSurface())
+  const drafts = useRef(new Map<string, string>())
+  const changeSurface = useCallback((next: 'history' | 'workspace') => {
+    setSurface(next)
+    saveSurface(next)
+  }, [])
+  useEffect(() => {
+    if (isLinuxHistorySite) return
+    const onMessage = (event: MessageEvent<{ type?: string }>) => {
+      if (event.data?.type === 'palimpsest:showWorkspace') changeSurface('workspace')
+    }
+    window.addEventListener('message', onMessage)
+    signalHostReady()
+    return () => window.removeEventListener('message', onMessage)
+  }, [changeSurface])
   const displayPath = repository.payload?.status === 'ready'
     ? repository.payload.repo.displayPath
     : repository.payload?.displayPath ?? ''
+  const openRepository = () => { if (!isLinuxHistorySite) { if (isVSCode) pickRepository(); else setPickerOpen(true) } }
   return (
     <>
-      <RepositoryWorkspace key={repository.revision} {...repository} onOpenRepository={() => { if (!isLinuxHistorySite) { if (isVSCode) pickRepository(); else setPickerOpen(true) } }} />
+      {surface === 'workspace' && !isLinuxHistorySite ? <GitWorkbench
+        key={displayPath}
+        repoPath={displayPath}
+        repositoryRevision={repository.revision}
+        repositoryLoading={repository.loading}
+        repositoryError={repository.error}
+        repoName={repository.payload?.status === 'ready' ? repository.payload.repo.name : repository.payload?.repoName ?? 'Repository'}
+        onOpenRepository={openRepository}
+        onHistory={() => changeSurface('history')}
+        onRepositoryChanged={repository.reload}
+        drafts={drafts.current}
+      /> : <RepositoryWorkspace key={repository.revision} {...repository} onOpenRepository={openRepository} onOpenWorkspace={() => changeSurface('workspace')} />}
       {!isLinuxHistorySite ? <RepositoryPicker open={pickerOpen} currentPath={displayPath} busy={repository.refreshing}
         error={repository.error} onOpen={async (path) => Boolean(await repository.openRepository(path))}
         onClose={() => setPickerOpen(false)} /> : null}
@@ -214,7 +245,7 @@ export function App() {
   )
 }
 
-function RepositoryWorkspace({ payload, loading, refreshing, error, refresh, onOpenRepository }: ReturnType<typeof useRepository> & { onOpenRepository: () => void }) {
+function RepositoryWorkspace({ payload, loading, refreshing, error, refresh, onOpenRepository, onOpenWorkspace }: ReturnType<typeof useRepository> & { onOpenRepository: () => void; onOpenWorkspace: () => void }) {
   const reducedMotion = useReducedMotion()
   const [mode, setMode] = useState<'overview' | 'inspect'>('inspect')
   const [filtersOpen, setFiltersOpen] = useState(false)
@@ -502,6 +533,7 @@ function RepositoryWorkspace({ payload, loading, refreshing, error, refresh, onO
         onOpenHelp={setHelpOpen}
         onCloseHelp={() => setHelpOpen(null)}
         onOpenRepository={onOpenRepository}
+        onOpenWorkspace={onOpenWorkspace}
       />
     )
   }
@@ -547,6 +579,7 @@ function RepositoryWorkspace({ payload, loading, refreshing, error, refresh, onO
         onSetMode={setMode}
         onOpenHelp={() => setHelpOpen('help')}
         onOpenRepository={onOpenRepository}
+        onOpenWorkspace={onOpenWorkspace}
       />
 
       <div className="workspace">

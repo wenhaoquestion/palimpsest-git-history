@@ -22,7 +22,7 @@ async function until(check) {
   }
 }
 
-async function fixture(t, { trusted = true, idleSeconds = 0 } = {}) {
+async function fixture(t, { trusted = true, idleSeconds = 0, floatingWindows = true } = {}) {
   const folder = await fs.mkdtemp(path.join(tmpdir(), 'palimpsest-extension-'))
   const repository = path.join(folder, 'repository')
   await fs.mkdir(path.join(repository, '.git'), { recursive: true })
@@ -37,11 +37,11 @@ async function fixture(t, { trusted = true, idleSeconds = 0 } = {}) {
     export function createRpcClient(options) {
       io.clients.push(options);
       return {
-        request: async ({url}, signal) => {
+        request: async ({url, method, body}, signal) => {
           io.requests++;
           if (signal?.aborted) throw signal.reason;
           if (io.requestHook) {
-            const result = await io.requestHook({url, signal, options});
+            const result = await io.requestHook({url, method, body, signal, options});
             if (result !== undefined) return result;
           }
           if (options.repoPath.endsWith('invalid')) return {status:500,body:{message:'Invalid Git metadata'}};
@@ -58,11 +58,13 @@ async function fixture(t, { trusted = true, idleSeconds = 0 } = {}) {
   const panels = []
   const notifications = []
   const stored = new Map()
+  const views = new Map()
+  const executed = []
   let serializer
   const uri = (fsPath) => ({ fsPath, toString: () => `file://${fsPath}` })
   const vscode = {
     Uri: { joinPath: (base, ...parts) => uri(path.join(base.fsPath, ...parts)) },
-    ViewColumn: { Active: -1 },
+    ViewColumn: { Active: -1, Beside: -2 },
     workspace: {
       isTrusted: trusted,
       workspaceFolders: [{ name: 'repository', uri: uri(repository) }],
@@ -70,33 +72,40 @@ async function fixture(t, { trusted = true, idleSeconds = 0 } = {}) {
     },
     commands: {
       registerCommand: (name, callback) => { commands.set(name, callback); return { dispose() {} } },
-      executeCommand: async (name, ...args) => commands.get(name)(...args),
+      getCommands: async () => [...commands.keys(), ...(floatingWindows ? ['workbench.action.moveEditorToNewWindow'] : [])],
+      executeCommand: async (name, ...args) => {
+        if (commands.has(name)) return commands.get(name)(...args)
+        executed.push({ name, args })
+        return io.commandHook?.(name, ...args)
+      },
     },
     window: {
       showWarningMessage: async (text) => notifications.push(text),
       showErrorMessage: async (text) => notifications.push(text),
+      showInformationMessage: async (text) => notifications.push(text),
       showQuickPick: async (items) => items[0],
       showOpenDialog: async () => [uri(repository)],
       registerWebviewPanelSerializer: (_type, value) => { serializer = value; return { dispose() {} } },
+      registerTreeDataProvider: (id, provider) => { views.set(id, provider); return { dispose: () => views.delete(id) } },
       createWebviewPanel: (type, title, column, options) => {
         const receive = event()
         const change = event()
         const dispose = event()
         const messages = []
         const panel = {
-          type, title, column, options, visible: true, revealCount: 0,
+          type, title, column, options, visible: true, active: true, revealCount: 0,
           webview: {
             cspSource: 'vscode-webview://test', messages,
             asWebviewUri: (asset) => ({ toString: () => `vscode-resource://${asset.fsPath}` }),
             onDidReceiveMessage: receive.subscribe,
             postMessage: async (message) => { messages.push(message); return true },
           },
-          reveal() { this.revealCount++; this.visible = true; change.emit({ webviewPanel: this }) },
+          reveal(column) { this.revealCount++; this.visible = true; this.active = true; if (column !== undefined) this.column = column; change.emit({ webviewPanel: this }) },
           onDidChangeViewState: change.subscribe,
           onDidDispose: dispose.subscribe,
           dispose: () => dispose.emit(),
           receive: receive.emit,
-          setVisible(value) { this.visible = value; change.emit({ webviewPanel: this }) },
+          setVisible(value) { this.visible = value; this.active = value; change.emit({ webviewPanel: this }) },
         }
         panels.push(panel)
         return panel
@@ -120,7 +129,7 @@ async function fixture(t, { trusted = true, idleSeconds = 0 } = {}) {
     delete globalThis[token]
     await fs.rm(folder, { recursive: true, force: true })
   })
-  return { folder, repository, commands, panels, io, notifications, context, uri, vscode, serializer }
+  return { folder, repository, commands, panels, io, notifications, context, uri, vscode, serializer, views, executed, deactivate: extensionModule.exports.deactivate }
 }
 
 test('opens one lazy webview with only packaged resources and a nonce CSP', async (t) => {
@@ -297,4 +306,177 @@ test('other conflicts and caller cancellations do not trigger repository recover
   assert.equal(panel.webview.messages.find((message) => message.id === 'conflict').status, 409)
   assert.equal(panel.webview.messages.some((message) => message.id === 'cancelled'), false)
   assert.equal(panel.webview.messages.some((message) => message.type === 'palimpsest:repositoryChanged'), false)
+})
+
+test('the native Activity Bar launcher stays lightweight until an action opens the workbench', async (t) => {
+  const app = await fixture(t)
+  const manifest = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'utf8'))
+  const container = manifest.contributes.viewsContainers.activitybar.find((item) => item.id === 'palimpsest')
+  assert.ok(container)
+  assert.ok(readFileSync(path.join(__dirname, container.icon), 'utf8').includes('<svg'))
+  assert.equal(app.views.get('palimpsest.launcher').getChildren().length, 0)
+  assert.equal(app.panels.length, 0)
+  assert.equal(app.io.clients.length, 0)
+  for (const item of manifest.contributes.commands) assert.ok(app.commands.has(item.command), item.command)
+  assert.ok(manifest.contributes.viewsWelcome.some((item) => item.contents.includes('command:palimpsest.openChanges')))
+})
+
+test('opening a native floating window focuses and moves the existing workbench once', async (t) => {
+  const app = await fixture(t)
+  await app.commands.get('palimpsest.open')()
+  const panel = app.panels[0]
+  panel.active = false
+  app.io.commandHook = (name) => {
+    assert.equal(name, 'workbench.action.moveEditorToNewWindow')
+    assert.equal(panel.active, true, 'The Palimpsest editor must be focused before moving it')
+  }
+  await app.commands.get('palimpsest.openInNewWindow')()
+  assert.equal(app.panels.length, 1)
+  assert.equal(app.executed.length, 1)
+  assert.equal(app.io.clients.length, 0)
+  panel.receive({ type: 'palimpsest:openToSide' })
+  await until(() => panel.column === app.vscode.ViewColumn.Beside)
+})
+
+test('unavailable and rejected floating-window commands preserve the workbench beside the editor', async (t) => {
+  const missing = await fixture(t, { floatingWindows: false })
+  await missing.commands.get('palimpsest.openInNewWindow')()
+  assert.equal(missing.panels[0].column, missing.vscode.ViewColumn.Beside)
+  assert.equal(missing.executed.length, 0)
+  assert.match(missing.notifications[0], /open beside your editor/)
+
+  const failed = await fixture(t)
+  await failed.commands.get('palimpsest.open')()
+  failed.panels[0].receive({ type: 'palimpsest:ready' })
+  failed.io.commandHook = () => { throw new Error('Floating windows unavailable') }
+  await failed.commands.get('palimpsest.openInNewWindow')()
+  assert.equal(failed.panels.length, 1)
+  assert.equal(failed.panels[0].column, failed.vscode.ViewColumn.Beside)
+  assert.match(failed.notifications[0], /open beside your editor/)
+  await failed.commands.get('palimpsest.openChanges')()
+  assert.ok(failed.panels[0].webview.messages.some((message) => message.type === 'palimpsest:showWorkspace'), 'Failed moves must preserve the existing readiness handshake')
+})
+
+test('Open Changes waits for webview readiness and survives a floating-window reload', async (t) => {
+  const app = await fixture(t)
+  await app.commands.get('palimpsest.openChanges')()
+  const panel = app.panels[0]
+  const shows = () => panel.webview.messages.filter((message) => message.type === 'palimpsest:showWorkspace')
+  assert.equal(shows().length, 0)
+  panel.receive({ type: 'palimpsest:ready' })
+  assert.equal(shows().length, 1)
+  await app.commands.get('palimpsest.openInNewWindow')()
+  await app.commands.get('palimpsest.openChanges')()
+  assert.equal(shows().length, 1)
+  panel.receive({ type: 'palimpsest:ready' })
+  assert.equal(shows().length, 2)
+  await app.commands.get('palimpsest.openChanges')()
+  assert.equal(shows().length, 3)
+})
+
+test('the bridge admits bounded workbench writes and rejects arbitrary POST routes and repository paths', async (t) => {
+  const app = await fixture(t)
+  let forwarded
+  app.io.requestHook = (request) => { forwarded = request }
+  await app.commands.get('palimpsest.open')()
+  const panel = app.panels[0]
+  panel.receive({ type: 'palimpsest:request', id: 'stage', method: 'POST', url: '/api/workspace/stage?repository=current', body: '{"paths":["src/file.ts"]}' })
+  await until(() => panel.webview.messages.some((message) => message.id === 'stage'))
+  assert.equal(forwarded.method, 'POST')
+  assert.deepEqual(JSON.parse(forwarded.body), { paths: ['src/file.ts'] })
+  for (const [id, url] of [['switch', '/api/repository'], ['unknown', '/api/workspace/run'], ['normalized', '/api/workspace/../repository']]) {
+    panel.receive({ type: 'palimpsest:request', id, method: 'POST', url, body: '{"path":"/private/another-repository"}' })
+    assert.equal(panel.webview.messages.find((message) => message.id === id).status, 405)
+  }
+  assert.equal(app.io.requests, 1)
+})
+
+async function pendingMutation(app) {
+  let finish
+  let signal
+  app.io.requestHook = (request) => {
+    if (request.url.includes('/api/workspace/commit')) {
+      signal = request.signal
+      return new Promise((resolve) => { finish = () => resolve({ status: 200, body: { repositoryChanged: true, repositoryId: 'after-commit' } }) })
+    }
+  }
+  await app.commands.get('palimpsest.open')()
+  const panel = app.panels[0]
+  panel.receive({ type: 'palimpsest:request', id: 'commit', method: 'POST', url: '/api/workspace/commit', body: '{"message":"Save change"}' })
+  await until(() => !!finish)
+  return { panel, signal, finish }
+}
+
+test('hidden views and caller cancellation retain a running mutation until it settles', async (t) => {
+  const app = await fixture(t)
+  const { panel, signal, finish } = await pendingMutation(app)
+  panel.receive({ type: 'palimpsest:cancel', id: 'commit' })
+  panel.receive({ type: 'palimpsest:request', id: 'second-write', method: 'POST', url: '/api/refresh' })
+  assert.equal(panel.webview.messages.find((message) => message.id === 'second-write').status, 409)
+  panel.setVisible(false)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(app.io.disposed, 0)
+  assert.equal(signal.aborted, false)
+  finish()
+  await until(() => app.io.disposed === 1)
+  assert.equal(app.io.requests, 1, 'Cancellation must not retry the commit')
+})
+
+test('showing a panel before its mutation finishes cancels the pending idle release', async (t) => {
+  const app = await fixture(t)
+  const { panel, finish } = await pendingMutation(app)
+  panel.setVisible(false)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  panel.setVisible(true)
+  finish()
+  await until(() => panel.webview.messages.some((message) => message.id === 'commit'))
+  assert.equal(app.io.disposed, 0)
+})
+
+test('native repository changes wait for the current mutation and then release its worker', async (t) => {
+  const app = await fixture(t)
+  const second = path.join(app.folder, 'second')
+  await fs.mkdir(path.join(second, '.git'), { recursive: true })
+  const { signal, finish } = await pendingMutation(app)
+  const switching = app.commands.get('palimpsest.openRepository')(app.uri(second))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(app.io.clients.length, 1)
+  assert.equal(signal.aborted, false)
+  finish()
+  await switching
+  assert.equal(app.io.clients.length, 2)
+  assert.equal(app.io.disposed, 1)
+  assert.equal(app.context.workspaceState.get('palimpsest.repositoryPath'), second)
+})
+
+test('closing the panel and deactivating await its in-flight write without killing or retrying it', async (t) => {
+  const app = await fixture(t)
+  const { panel, signal, finish } = await pendingMutation(app)
+  panel.dispose()
+  let stopped = false
+  const stopping = app.deactivate().then(() => { stopped = true })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(stopped, false)
+  assert.equal(app.io.disposed, 0)
+  assert.equal(signal.aborted, false)
+  finish()
+  await stopping
+  assert.equal(app.io.disposed, 1)
+  assert.equal(app.io.requests, 1)
+})
+
+test('a stale read response cannot abort or suppress a concurrent commit result', async (t) => {
+  const app = await fixture(t)
+  const { panel, signal, finish } = await pendingMutation(app)
+  const commitHook = app.io.requestHook
+  app.io.requestHook = (request) => request.url === '/api/commits?repository=old'
+    ? { status: 409, body: { error: { code: 'REPOSITORY_CHANGED' } } }
+    : commitHook(request)
+  panel.receive({ type: 'palimpsest:request', id: 'old-read', method: 'GET', url: '/api/commits?repository=old' })
+  await until(() => panel.webview.messages.some((message) => message.id === 'old-read'))
+  assert.equal(signal.aborted, false)
+  finish()
+  await until(() => panel.webview.messages.some((message) => message.id === 'commit'))
+  assert.equal(panel.webview.messages.find((message) => message.id === 'commit').status, 200)
+  assert.equal(app.io.requests, 2)
 })

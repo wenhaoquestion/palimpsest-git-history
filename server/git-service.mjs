@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
-import { createWriteStream, rmSync } from 'node:fs'
-import { mkdtemp, open, rm, stat } from 'node:fs/promises'
+import { constants, createWriteStream, rmSync } from 'node:fs'
+import { lstat, mkdtemp, open, readlink, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -30,6 +30,9 @@ const DEFAULT_LANDSCAPE_FILE_LIMIT = 720
 const DEFAULT_LANDSCAPE_CHANGE_LIMIT = 384
 const DEFAULT_TREE_PAGE_LIMIT = 256
 const MAX_TREE_PAGE_LIMIT = 1000
+const MAX_WORKSPACE_ENTRIES = 1024
+const MAX_MUTATION_QUEUE = 16
+const MUTATION_QUEUES = new Map()
 
 const EMPTY_STATS = Object.freeze({ files: 0, additions: 0, deletions: 0, binaries: 0 })
 const ACTIVE_INDEX_DIRECTORIES = new Set()
@@ -1147,6 +1150,63 @@ function publicRef(ref) {
   return value
 }
 
+function validateWorkspacePath(value) {
+  const filePath = validateGitPath(value)
+  if (filePath.includes('\\') || filePath.split('/').some((part) => part.toLowerCase() === '.git')) {
+    throw new GitServiceError('Choose a working-tree path using forward slashes, outside Git metadata.', {
+      code: 'INVALID_PATH', status: 400,
+    })
+  }
+  return filePath
+}
+
+function parseWorkspaceStatus(buffer) {
+  const workspace = {
+    branch: null, headOid: null, upstream: null, ahead: 0, behind: 0,
+    staged: [], unstaged: [], untracked: [], conflicts: [],
+    counts: { staged: 0, unstaged: 0, untracked: 0, conflicts: 0 },
+    clean: true, truncated: false,
+  }
+  let included = 0
+  const add = (kind, change) => {
+    workspace.counts[kind] += 1
+    if (included < MAX_WORKSPACE_ENTRIES) { workspace[kind].push(change); included += 1 }
+    else workspace.truncated = true
+  }
+  const pathAfter = (record, fields) => {
+    let offset = 0
+    for (let index = 0; index < fields; index += 1) offset = record.indexOf(' ', offset) + 1
+    return record.slice(offset)
+  }
+  const records = buffer.toString('utf8').split('\0')
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index]
+    if (record.startsWith('# branch.oid ')) {
+      workspace.headOid = record.slice(13) === '(initial)' ? null : record.slice(13)
+    } else if (record.startsWith('# branch.head ')) {
+      workspace.branch = record.slice(14) === '(detached)' ? null : record.slice(14)
+    } else if (record.startsWith('# branch.upstream ')) {
+      workspace.upstream = record.slice(18)
+    } else if (record.startsWith('# branch.ab ')) {
+      const match = /^# branch.ab \+(\d+) -(\d+)$/.exec(record)
+      if (match) { workspace.ahead = Number(match[1]); workspace.behind = Number(match[2]) }
+    } else if (record.startsWith('? ')) {
+      add('untracked', { path: record.slice(2), status: '?' })
+    } else if (record.startsWith('u ')) {
+      add('conflicts', { path: pathAfter(record, 10), status: record.slice(2, 4) })
+    } else if (record.startsWith('1 ') || record.startsWith('2 ')) {
+      const renamed = record[0] === '2'
+      const filePath = pathAfter(record, renamed ? 9 : 8)
+      const previousPath = renamed ? records[++index] : undefined
+      const change = { path: filePath, ...(previousPath ? { previousPath } : {}) }
+      if (record[2] !== '.') add('staged', { ...change, status: record[2] })
+      if (record[3] !== '.') add('unstaged', { ...change, status: record[3] })
+    }
+  }
+  workspace.clean = Object.values(workspace.counts).every((count) => count === 0)
+  return workspace
+}
+
 export function createGitService({
   repoPath = process.cwd(),
   gitBinary = 'git',
@@ -1170,6 +1230,9 @@ export function createGitService({
     GIT_PAGER: 'cat',
     LC_ALL: 'C',
     LANG: 'C',
+  }
+  for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE']) {
+    delete gitEnvironment[name]
   }
   const literalPathEnvironment = { ...gitEnvironment, GIT_LITERAL_PATHSPECS: '1' }
   let rootPromise
@@ -2148,6 +2211,240 @@ export function createGitService({
     }
   }
 
+  async function requireWorktree() {
+    const root = await resolveRoot()
+    const result = await git(['rev-parse', '--is-inside-work-tree'], { maxOutput: 1024 })
+    if (result.stdout.toString('utf8').trim() !== 'true') {
+      throw new GitServiceError('This repository has no working tree. Open a working copy to use Git operations.', {
+        code: 'WORKTREE_REQUIRED', status: 409,
+      })
+    }
+    return root
+  }
+
+  async function readWorkspace() {
+    const root = await requireWorktree()
+    const [statusResult, branchResult, remoteResult] = await Promise.all([
+      git(['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all'], { maxOutput: 4 * 1024 * 1024 }),
+      git(['for-each-ref', '--format=%(refname:short)%00%(HEAD)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)', 'refs/heads'], { maxOutput: 1024 * 1024 }),
+      git(['remote'], { maxOutput: 64 * 1024 }),
+    ])
+    const workspace = parseWorkspaceStatus(statusResult.stdout)
+    workspace.repoPath = root
+    workspace.branches = branchResult.stdout.toString('utf8').trim().split('\n').filter(Boolean).map((line) => {
+      const [name, current, upstream, remote, remoteRef] = line.split('\0')
+      return {
+        name, current: current === '*', upstream: upstream || null,
+        remote: remote || null,
+        remoteBranch: remoteRef?.startsWith('refs/heads/') ? remoteRef.slice(11) : null,
+      }
+    })
+    workspace.remotes = remoteResult.stdout.toString('utf8').split('\n').filter(Boolean).map((name) => ({ name }))
+    return workspace
+  }
+
+  async function getWorkspace() {
+    const root = await resolveRoot()
+    await MUTATION_QUEUES.get(root)?.tail
+    return readWorkspace()
+  }
+
+  async function queueMutation(operation) {
+    const root = await resolveRoot()
+    let queue = MUTATION_QUEUES.get(root)
+    if (!queue) { queue = { tail: Promise.resolve(), count: 0 }; MUTATION_QUEUES.set(root, queue) }
+    if (queue.count >= MAX_MUTATION_QUEUE) {
+      throw new GitServiceError('Too many Git operations are pending for this repository.', { code: 'GIT_BUSY', status: 503 })
+    }
+    queue.count += 1
+    const result = queue.tail.then(() => { assertActive(); return operation() })
+    queue.tail = result.catch(() => undefined).finally(() => {
+      queue.count -= 1
+      if (!queue.count) MUTATION_QUEUES.delete(root)
+    })
+    return result
+  }
+
+  function invalidateMutableHistory() {
+    generation += 1
+    repositoryPromise = undefined
+    refResolutionCache.clear()
+    pageCache.clear()
+    // OID-keyed trees, diffs, objects, and already-built history indexes remain
+    // valid. Fetch/push/staging must not rebuild an unchanged Linux HEAD.
+  }
+
+  async function validateBranchName(value) {
+    if (typeof value !== 'string' || !value || value.length > 240 || value !== value.trim()
+      || value.startsWith('-') || value.includes('@{') || /[\u0000-\u001f\u007f]/.test(value)) {
+      throw new GitServiceError('Provide a valid branch name.', { code: 'INVALID_BRANCH', status: 400 })
+    }
+    const result = await git(['check-ref-format', '--branch', value], { allowFailure: true, maxOutput: 1024 })
+    if (result.exitCode !== 0) throw new GitServiceError('Provide a valid branch name.', { code: 'INVALID_BRANCH', status: 400 })
+    return value
+  }
+
+  function selectedPaths(options, workspace, action) {
+    if (options.all === true && options.paths !== undefined) {
+      throw new GitServiceError('Choose either all files or specific paths.', { code: 'INVALID_PATHS', status: 400 })
+    }
+    if (options.all === true) return ['.']
+    if (!Array.isArray(options.paths) || options.paths.length === 0 || options.paths.length > 256) {
+      throw new GitServiceError('Select between 1 and 256 paths, or choose all files.', { code: 'INVALID_PATHS', status: 400 })
+    }
+    const paths = new Set(options.paths.map(validateWorkspacePath))
+    if (action === 'unstage') {
+      for (const entry of workspace.staged) {
+        if (entry.status !== 'R' || !entry.previousPath) continue
+        if ([...paths].some((selected) => [entry.path, entry.previousPath].some((name) => name === selected || name.startsWith(`${selected}/`)))) {
+          paths.add(entry.path)
+          paths.add(entry.previousPath)
+        }
+      }
+    }
+    return [...paths]
+  }
+
+  async function runMutationGit(args, options = {}) {
+    const result = await git(args, { maxOutput: 1024 * 1024, truncate: true, allowFailure: true, ...options })
+    if (result.exitCode !== 0) {
+      const detail = cleanGitError(result.stderr || result.stdout.toString('utf8'))
+      const missingIdentity = /identity unknown|unable to auto-detect email|tell me who you are/i.test(result.stderr)
+      throw new GitServiceError(missingIdentity
+        ? 'Configure your Git user.name and user.email before committing.'
+        : detail || 'Git could not complete this operation.', {
+        code: missingIdentity ? 'IDENTITY_REQUIRED' : 'GIT_OPERATION_FAILED', status: 409, detail,
+      })
+    }
+    return result
+  }
+
+  async function mutateWorkspace(action, options = {}) {
+    const actions = ['stage', 'unstage', 'commit', 'branch', 'checkout', 'fetch', 'pull', 'push']
+    if (!actions.includes(action) || !options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new GitServiceError('The requested Git operation is invalid.', { code: 'INVALID_OPERATION', status: 400 })
+    }
+    return queueMutation(async () => {
+      const before = await readWorkspace()
+      const repositoryChanged = action !== 'stage' && action !== 'unstage'
+      if (action === 'stage' || action === 'unstage') {
+        const paths = selectedPaths(options, before, action)
+        const input = Buffer.from(`${paths.join('\0')}\0`)
+        const args = action === 'stage' ? ['add', '--all']
+          : before.headOid ? ['restore', '--staged', '--source=HEAD']
+            : ['rm', '--cached', '-r', '-f', '--ignore-unmatch']
+        await runMutationGit([...args, '--pathspec-from-file=-', '--pathspec-file-nul'], { input, literalPaths: true })
+      } else if (action === 'commit') {
+        if (typeof options.message !== 'string' || !options.message.trim() || Buffer.byteLength(options.message) > 12 * 1024 || options.message.includes('\0')) {
+          throw new GitServiceError('Provide a commit message of at most 12 KB.', { code: 'INVALID_COMMIT_MESSAGE', status: 400 })
+        }
+        if (before.counts.conflicts) throw new GitServiceError('Resolve and stage merge conflicts before committing.', { code: 'UNRESOLVED_CONFLICTS', status: 409 })
+        if (!before.counts.staged) throw new GitServiceError('Stage changes before committing.', { code: 'NOTHING_TO_COMMIT', status: 409 })
+        await runMutationGit(['commit', '--file=-', '--cleanup=strip'], { input: Buffer.from(options.message) })
+      } else if (action === 'branch' || action === 'checkout') {
+        const name = await validateBranchName(options.name)
+        if (action === 'branch') {
+          if (options.checkout !== undefined && typeof options.checkout !== 'boolean') {
+            throw new GitServiceError('The checkout option must be a boolean.', { code: 'INVALID_OPERATION', status: 400 })
+          }
+          if (!before.headOid && options.checkout === false) {
+            throw new GitServiceError('Create the first commit before creating an inactive branch.', { code: 'EMPTY_REPOSITORY', status: 409 })
+          }
+          await runMutationGit(options.checkout === false ? ['branch', '--', name] : ['switch', '-c', name])
+        } else {
+          if (!before.branches.some((branch) => branch.name === name)) {
+            throw new GitServiceError('Choose an existing local branch.', { code: 'BRANCH_NOT_FOUND', status: 404 })
+          }
+          await runMutationGit(['switch', '--no-guess', '--', name])
+        }
+      } else {
+        if (before.counts.conflicts && action === 'pull') {
+          throw new GitServiceError('Resolve existing conflicts before pulling.', { code: 'UNRESOLVED_CONFLICTS', status: 409 })
+        }
+        const tracking = before.branches.find((branch) => branch.current)
+        const remote = options.remote ?? tracking?.remote
+          ?? before.remotes.find((entry) => entry.name === 'origin')?.name
+          ?? (before.remotes.length === 1 ? before.remotes[0].name : undefined)
+        if (typeof remote !== 'string' || !before.remotes.some((entry) => entry.name === remote) || remote.startsWith('-')) {
+          throw new GitServiceError('Choose a configured Git remote.', { code: 'REMOTE_REQUIRED', status: 400 })
+        }
+        const requestedBranch = options.branch ?? (tracking?.remote === remote ? tracking.remoteBranch : null) ?? before.branch
+        const branch = requestedBranch ? await validateBranchName(requestedBranch) : null
+        if (action !== 'fetch' && (!before.branch || !branch)) {
+          throw new GitServiceError('Check out a local branch before pulling or pushing.', { code: 'BRANCH_REQUIRED', status: 409 })
+        }
+        if (action === 'fetch') {
+          const fetchBranch = options.branch === undefined ? [] : [await validateBranchName(options.branch)]
+          await runMutationGit(['fetch', '--', remote, ...fetchBranch])
+        } else if (action === 'pull') {
+          await runMutationGit(['-c', 'merge.autoStash=false', '-c', 'rebase.autoStash=false', 'pull', '--ff-only', '--no-rebase', '--no-autostash', '--', remote, branch])
+        } else {
+          if (!before.headOid) throw new GitServiceError('Create a commit before pushing.', { code: 'EMPTY_REPOSITORY', status: 409 })
+          await runMutationGit(['push', '--porcelain', '--set-upstream', '--', remote, `HEAD:refs/heads/${branch}`])
+        }
+      }
+      if (repositoryChanged) invalidateMutableHistory()
+      return {
+        workspace: await readWorkspace(), repositoryChanged,
+        message: { stage: 'Changes staged.', unstage: 'Changes unstaged.', commit: 'Commit created.', branch: 'Branch created.', checkout: 'Branch switched.', fetch: 'Remote fetched.', pull: 'Fast-forward pull completed.', push: 'Changes pushed.' }[action],
+      }
+    })
+  }
+
+  async function getWorkspaceDiff(filePath, { staged = false } = {}) {
+    const root = await requireWorktree()
+    await MUTATION_QUEUES.get(root)?.tail
+    const safePath = validateWorkspacePath(filePath)
+    const segments = safePath.split('/')
+    let target = root
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      target = path.join(target, segments[index])
+      const parent = await lstat(target).catch((error) => {
+        if (error.code === 'ENOENT') return null
+        throw error
+      })
+      if (!parent) break
+      if (parent.isSymbolicLink()) {
+        throw new GitServiceError('Workspace previews cannot traverse symbolic-link directories.', { code: 'INVALID_PATH', status: 400 })
+      }
+    }
+    const result = await git(['diff', '--no-ext-diff', '--no-textconv', '--no-color',
+      ...(staged ? ['--cached'] : []), '--', safePath], {
+      literalPaths: true, maxOutput: diffLimit, truncate: true,
+    })
+    const patch = result.stdout.toString('utf8')
+    if (staged || patch) {
+      return { path: safePath, patch, truncated: result.truncated, binary: /(?:^|\n)Binary files .* differ(?:\n|$)/.test(patch) }
+    }
+    const tracked = await git(['ls-files', '--error-unmatch', '--', safePath], { literalPaths: true, allowFailure: true, maxOutput: 1024 * 1024 })
+    if (tracked.exitCode === 0) return { path: safePath, patch: '', binary: false, truncated: false }
+
+    target = path.join(root, ...segments)
+    const info = await lstat(target).catch(() => null)
+    if (!info || (!info.isFile() && !info.isSymbolicLink())) {
+      throw new GitServiceError('Choose an existing working-tree file to preview.', { code: 'FILE_NOT_FOUND', status: 404 })
+    }
+    const limit = Math.min(diffLimit, 256 * 1024)
+    let contents
+    if (info.isSymbolicLink()) contents = Buffer.from(await readlink(target))
+    else {
+      const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0))
+      try {
+        const buffer = Buffer.alloc(Math.min(info.size, limit + 1))
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+        contents = buffer.subarray(0, bytesRead)
+      } finally { await handle.close() }
+    }
+    const truncated = contents.length > limit || info.size > limit
+    contents = contents.subarray(0, limit)
+    const binary = contents.includes(0)
+    const text = contents.toString('utf8')
+    const lines = text ? text.replace(/\n$/, '').split('\n') : []
+    const preview = binary ? `Binary untracked file (${info.size} bytes).`
+      : `diff --git ${JSON.stringify(`a/${safePath}`)} ${JSON.stringify(`b/${safePath}`)}\nnew file mode ${info.isSymbolicLink() ? '120000' : '100644'}\n--- /dev/null\n+++ ${JSON.stringify(`b/${safePath}`)}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((line) => `+${line}`).join('\n')}\n`
+    return { path: safePath, patch: preview, binary, truncated, untracked: true }
+  }
+
   async function clearRepository() {
     disposed = true
     const stopped = processPool.dispose()
@@ -2187,7 +2484,7 @@ export function createGitService({
     return disposalPromise
   }
 
-  async function refresh(options) {
+  async function refreshSnapshot(options) {
     if (permanentlyDisposed) throw cancellationError()
     restartPromise ||= (async () => {
       disposalPromise ||= clearRepository()
@@ -2201,6 +2498,14 @@ export function createGitService({
     })().finally(() => { restartPromise = undefined })
     await restartPromise
     return getRepository(options)
+  }
+
+  async function refresh(options) {
+    if (permanentlyDisposed) throw cancellationError()
+    // An explicit refresh must wait for a commit/push already in flight; its
+    // cache cleanup stops Git processes and would otherwise interrupt writes.
+    const root = await resolveRoot().catch(() => null)
+    return root ? queueMutation(() => refreshSnapshot(options)) : refreshSnapshot(options)
   }
 
   function getResourceUsage() {
@@ -2226,6 +2531,9 @@ export function createGitService({
     getChanges,
     getDiff,
     getFileHistory,
+    getWorkspace,
+    getWorkspaceDiff,
+    mutateWorkspace,
     refresh,
     dispose,
     getResourceUsage,

@@ -7,6 +7,9 @@ import type {
   FileHistoryEntry,
   RepositoryPayload,
   TreePagePayload,
+  WorkspaceStatus,
+  WorkspaceMutationResult,
+  WorkspaceDiff,
 } from '../types/git'
 import { hostRequest, isVSCode } from './host'
 
@@ -56,6 +59,16 @@ async function request<T>(path: string, init?: RequestInit, scoped = true): Prom
 }
 
 export const gitApi = {
+  workspace: (signal?: AbortSignal) => request<WorkspaceStatus>('/api/workspace', { signal }),
+
+  workspaceDiff: (path: string, staged: boolean, signal?: AbortSignal) =>
+    request<WorkspaceDiff>(`/api/workspace/diff?${new URLSearchParams({ path, staged: String(staged) })}`, { signal }),
+
+  workspaceAction: (action: 'stage' | 'unstage' | 'commit' | 'branch' | 'checkout' | 'fetch' | 'pull' | 'push', body: Record<string, unknown>) =>
+    request<WorkspaceMutationResult>(`/api/workspace/${action}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }),
+
   repository: (signal?: AbortSignal) =>
     request<RepositoryPayload>('/api/repository?stats=false', { signal }, false),
 

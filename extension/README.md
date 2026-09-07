@@ -1,6 +1,20 @@
-# Palimpsest — Git History
+# Palimpsest — Git Workbench
 
-See how your repository took shape. Palimpsest turns Git history into an interactive landscape of directories and files, right inside VS Code.
+Explore your history and manage your next commit in one Git workbench. Palimpsest combines an interactive repository landscape with working changes, staging, commits, branches, and remote operations. Open it from its own Activity Bar entry, beside your code, or in a separate VS Code window.
+
+![Working changes, a file diff, commit message, branch selection, and remote actions](media/workbench.png)
+
+*A temporary example repository used to verify the complete Git workflow.*
+
+## Make your next commit
+
+- Review staged, modified, untracked, and conflicted files, with on-demand diffs.
+- Stage or unstage individual files, or the complete working tree.
+- Write a message and commit the staged changes using your existing Git identity and hooks.
+- Create a branch from HEAD or switch between local branches. Git reports conflicting local changes without forcing checkout.
+- Fetch, pull with fast-forward only, and push to a configured remote. Existing upstream branch names are respected; the first push establishes upstream tracking.
+
+Operations show their result in the workbench. Commits and branch changes refresh history; staging does not rebuild it. Refresh working changes after external edits. Remote operations use your existing Git authentication configuration; if interactive authentication is required, complete it using VS Code's Git integration or terminal and retry. Running writes finish before an idle worker is released, and writes are never automatically retried.
 
 ![Palimpsest in VS Code, showing a commit timeline, repository landscape, and changed-file inspector](media/history-vscode.png)
 
@@ -16,7 +30,7 @@ See how your repository took shape. Palimpsest turns Git history into an interac
 
 ## Install and open
 
-Search for **Palimpsest — Git History** by **wenhao_question** in VS Code's Extensions view. Packaged `.vsix` builds are also available from [GitHub Releases](https://github.com/wenhaoquestion/palimpsest-git-history/releases); install them with **Extensions: Install from VSIX…**.
+Search for **Palimpsest — Git Workbench** by **wenhao_question** in VS Code's Extensions view. Packaged `.vsix` builds are also available from [GitHub Releases](https://github.com/wenhaoquestion/palimpsest-git-history/releases); install them with **Extensions: Install from VSIX…**.
 
 Or install the Marketplace extension with:
 
@@ -27,8 +41,10 @@ code --install-extension wenhaoquestion.palimpsest-git-history
 After installation:
 
 1. Open a trusted workspace containing a Git repository.
-2. Run **Palimpsest: Open Git History** from the Command Palette.
-3. Drag the timeline, select a commit, or press **Play**.
+2. Click **Palimpsest** in the Activity Bar, or run **Palimpsest: Open Git Workbench**.
+3. Explore **History**, or open **Changes** to stage files and make a commit.
+
+Use **Open in New Window** to move the workbench into a native floating window, similar to other VS Code tools. Its current page, history position, and commit draft survive the move. **Open to the Side** places it beside your code. On hosts without the floating-window command, the extension opens to the side and explains the fallback.
 
 A single workspace repository opens automatically. When multiple repositories are found, choose one from the picker. To open another project, run **Palimpsest: Choose Repository…** or right-click a folder in Explorer.
 
@@ -36,7 +52,10 @@ A single workspace repository opens automatically. When multiple repositories ar
 
 | Command | Action |
 | --- | --- |
-| **Palimpsest: Open Git History** | Open or reveal the history view. |
+| **Palimpsest: Open Git Workbench** | Open or reveal the workbench. |
+| **Palimpsest: Open Working Changes** | Open staging, commit, and branch controls. |
+| **Palimpsest: Open in New Window** | Move the workbench to a separate VS Code window. |
+| **Palimpsest: Open to the Side** | Open beside the current editor. |
 | **Palimpsest: Choose Repository…** | Select a workspace repository or browse for another folder. |
 | **Palimpsest: Refresh Git History** | Reload after commits or branches change. |
 
@@ -46,7 +65,9 @@ With the history view focused, **Space** plays or pauses, **← / →** steps be
 
 History summaries and file listings load in pages. The landscape uses representative file blocks and directory totals to keep large trees readable; exact paths and diffs remain available through the inspector. Initial indexing of a large history can take longer than later navigation.
 
-Git runs in an isolated worker. Hiding the view pauses playback and cancels pending UI requests; the worker and its caches are released after an idle interval. Reopening restores the selected repository, branch scope, and commit position.
+Panning and continuous zooming reuse a viewport image, followed by a crisp redraw after zooming stops. Hover overlays do not rebuild the scene. The display and two cached canvases together allow at most 48 MiB of RGBA pixel storage; browser/GPU overhead is additional. Hidden views release cached canvases, and an idle scene draws no frames.
+
+Git runs in an isolated worker. Hiding the view pauses playback and cancels pending reads; the worker and its caches are released after an idle interval once running writes finish. Restoring the hidden view preserves the selected repository, branch scope, and commit position.
 
 | Setting | Default | What it controls |
 | --- | ---: | --- |

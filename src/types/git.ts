@@ -206,3 +206,42 @@ export interface CommitIndexPayload {
   total: number
   ref: string
 }
+
+export interface WorkspaceChange {
+  path: string
+  previousPath?: string
+  status: string
+}
+
+export interface WorkspaceStatus {
+  repoPath: string
+  branch: string | null
+  headOid: string | null
+  upstream: string | null
+  ahead: number
+  behind: number
+  staged: WorkspaceChange[]
+  unstaged: WorkspaceChange[]
+  untracked: WorkspaceChange[]
+  conflicts: WorkspaceChange[]
+  branches: { name: string; current: boolean; upstream: string | null; remote: string | null; remoteBranch: string | null }[]
+  remotes: { name: string }[]
+  counts: { staged: number; unstaged: number; untracked: number; conflicts: number }
+  clean: boolean
+  truncated: boolean
+}
+
+export interface WorkspaceMutationResult {
+  workspace: WorkspaceStatus
+  repositoryChanged: boolean
+  repositoryId: string
+  message: string
+}
+
+export interface WorkspaceDiff {
+  path: string
+  patch: string
+  binary: boolean
+  truncated: boolean
+  untracked?: boolean
+}

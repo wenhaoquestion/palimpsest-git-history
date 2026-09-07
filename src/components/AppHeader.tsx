@@ -1,4 +1,5 @@
 import { isLinuxHistorySite } from '../lib/site'
+import { isVSCode, openInNewWindow } from '../lib/host'
 import type { RepositoryInfo } from '../types/git'
 import {
   BranchIcon,
@@ -20,6 +21,7 @@ interface AppHeaderProps {
   onSetMode: (mode: 'overview' | 'inspect') => void
   onOpenHelp: () => void
   onOpenRepository: () => void
+  onOpenWorkspace?: () => void
 }
 
 export function AppHeader({
@@ -32,6 +34,7 @@ export function AppHeader({
   onSetMode,
   onOpenHelp,
   onOpenRepository,
+  onOpenWorkspace,
 }: AppHeaderProps) {
   return (
     <header className="app-header">
@@ -53,6 +56,10 @@ export function AppHeader({
       </div>
 
       <nav className="header-actions" aria-label="Workspace controls">
+        {!isLinuxHistorySite && onOpenWorkspace ? <button className="header-button workbench-button" type="button" onClick={onOpenWorkspace} aria-label="Working changes" title="Working changes, commits, and branches">
+          <BranchIcon /><span>Changes</span>
+        </button> : null}
+        {!isLinuxHistorySite && isVSCode ? <button className="header-button detach-button" type="button" onClick={openInNewWindow} aria-label="Open in new window" title="Open in new window"><span aria-hidden="true">↗</span></button> : null}
         {!isLinuxHistorySite ? <button className="header-button open-repository-button" type="button" onClick={onOpenRepository} aria-label="Open repository">
           <FolderIcon /><span>Open</span>
         </button> : null}
