@@ -1,0 +1,16 @@
+node_modules/
+dist/
+extension/dist/
+extension/server/
+releases/
+.palimpsest-cache/
+.palimpsest-target/
+.qa/
+.qa-create-fixture.mjs
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key

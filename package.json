@@ -1,0 +1,30 @@
+{
+  "name": "palimpsest",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "build:extension": "npm run build && node scripts/build-extension.mjs",
+    "package:extension": "npm run build:extension && node scripts/package-extension.mjs",
+    "start": "node server/app.mjs",
+    "test": "node --test server/*.test.mjs extension/*.test.cjs",
+    "benchmark": "node server/benchmark-git-service.mjs",
+    "benchmark:memory": "node --expose-gc server/benchmark-git-memory.mjs",
+    "check": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "name": "palimpsest-git-history",
+  "displayName": "Palimpsest — Git History",
+  "description": "Explore any local Git repository as an interactive architectural landscape, directly in VS Code.",
+  "version": "0.1.0",
+  "publisher": "wenhaoquestion",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wenhaoquestion/palimpsest-git-history.git",
+    "directory": "extension"
+  },
+  "homepage": "https://github.com/wenhaoquestion/palimpsest-git-history#readme",
+  "bugs": { "url": "https://github.com/wenhaoquestion/palimpsest-git-history/issues" },
+  "icon": "media/icon.png",
+  "galleryBanner": { "color": "#101411", "theme": "dark" },
+  "pricing": "Free",
+  "engines": { "vscode": "^1.95.0" },
+  "categories": ["Visualization", "Other"],
+  "keywords": ["git", "history", "visualization", "timeline", "repository"],
+  "main": "./extension.cjs",
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onWebviewPanel:palimpsest.history"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Reading repository history starts Git processes. Trust the workspace before opening Palimpsest."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Palimpsest requires a filesystem repository and Git on the workspace host."
+    }
+  },
+  "contributes": {
+    "commands": [
+      { "command": "palimpsest.open", "title": "Open Git History", "category": "Palimpsest", "enablement": "isWorkspaceTrusted" },
+      { "command": "palimpsest.openRepository", "title": "Choose Repository…", "category": "Palimpsest", "enablement": "isWorkspaceTrusted" },
+      { "command": "palimpsest.refresh", "title": "Refresh Git History", "category": "Palimpsest", "enablement": "isWorkspaceTrusted" }
+    ],
+    "menus": {
+      "explorer/context": [{ "command": "palimpsest.openRepository", "when": "explorerResourceIsFolder && isWorkspaceTrusted", "group": "navigation@90" }],
+      "editor/title": [{ "command": "palimpsest.refresh", "when": "activeWebviewPanelId == palimpsest.history", "group": "navigation" }]
+    },
+    "configuration": {
+      "title": "Palimpsest",
+      "properties": {
+        "palimpsest.workerIdleSeconds": {
+          "type": "number", "default": 30, "minimum": 0, "maximum": 300,
+          "scope": "machine-overridable",
+          "description": "Seconds after hiding the history view before releasing its Git worker and caches. Set 0 to release immediately."
+        },
+        "palimpsest.workerMaxHeapMb": {
+          "type": "number", "default": 384, "minimum": 128, "maximum": 2048,
+          "scope": "machine-overridable",
+          "description": "JavaScript heap limit for the isolated Git worker in MB. Applied when the worker next starts; this is not a total-process memory limit."
+        }
+      }
+    }
+  }
+}
