@@ -22,7 +22,7 @@ async function until(check) {
   }
 }
 
-async function fixture(t, { trusted = true, idleSeconds = 0, floatingWindows = true } = {}) {
+async function fixture(t, { trusted = true, idleSeconds = 0, floatingWindows = true, launcherVisible = false } = {}) {
   const folder = await fs.mkdtemp(path.join(tmpdir(), 'palimpsest-extension-'))
   const repository = path.join(folder, 'repository')
   await fs.mkdir(path.join(repository, '.git'), { recursive: true })
@@ -59,6 +59,7 @@ async function fixture(t, { trusted = true, idleSeconds = 0, floatingWindows = t
   const notifications = []
   const stored = new Map()
   const views = new Map()
+  const treeViews = new Map()
   const executed = []
   let serializer
   const uri = (fsPath) => ({ fsPath, toString: () => `file://${fsPath}` })
@@ -86,7 +87,18 @@ async function fixture(t, { trusted = true, idleSeconds = 0, floatingWindows = t
       showQuickPick: async (items) => items[0],
       showOpenDialog: async () => [uri(repository)],
       registerWebviewPanelSerializer: (_type, value) => { serializer = value; return { dispose() {} } },
-      registerTreeDataProvider: (id, provider) => { views.set(id, provider); return { dispose: () => views.delete(id) } },
+      createTreeView: (id, options) => {
+        const visibility = event()
+        views.set(id, options.treeDataProvider)
+        const view = {
+          visible: launcherVisible,
+          onDidChangeVisibility: visibility.subscribe,
+          setVisible(value) { this.visible = value; visibility.emit({ visible: value }) },
+          dispose() { views.delete(id); treeViews.delete(id) },
+        }
+        treeViews.set(id, view)
+        return view
+      },
       createWebviewPanel: (type, title, column, options) => {
         const receive = event()
         const change = event()
@@ -129,7 +141,7 @@ async function fixture(t, { trusted = true, idleSeconds = 0, floatingWindows = t
     delete globalThis[token]
     await fs.rm(folder, { recursive: true, force: true })
   })
-  return { folder, repository, commands, panels, io, notifications, context, uri, vscode, serializer, views, executed, deactivate: extensionModule.exports.deactivate }
+  return { folder, repository, commands, panels, io, notifications, context, uri, vscode, serializer, views, treeViews, executed, deactivate: extensionModule.exports.deactivate }
 }
 
 test('opens one lazy webview with only packaged resources and a nonce CSP', async (t) => {
@@ -319,6 +331,77 @@ test('the native Activity Bar launcher stays lightweight until an action opens t
   assert.equal(app.io.clients.length, 0)
   for (const item of manifest.contributes.commands) assert.ok(app.commands.has(item.command), item.command)
   assert.ok(manifest.contributes.viewsWelcome.some((item) => item.contents.includes('command:palimpsest.openChanges')))
+})
+
+test('clicking the Activity Bar opens the workbench once and subsequent genuine visits reveal it', async (t) => {
+  const app = await fixture(t)
+  const launcher = app.treeViews.get('palimpsest.launcher')
+  launcher.setVisible(true)
+  await until(() => !!app.panels[0]?.webview.html)
+  const panel = app.panels[0]
+  launcher.setVisible(true)
+  launcher.setVisible(true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(app.panels.length, 1)
+  assert.equal(panel.revealCount, 0, 'Duplicate visible notifications cannot loop into repeated opens')
+  launcher.setVisible(false)
+  launcher.setVisible(true)
+  await until(() => panel.revealCount === 1)
+  assert.equal(app.panels.length, 1)
+  assert.equal(app.io.clients.length, 0, 'The launcher does not start an extra worker')
+})
+
+test('a launcher already visible when the extension activates opens without a second click', async (t) => {
+  const app = await fixture(t, { launcherVisible: true })
+  await until(() => !!app.panels[0]?.webview.html)
+  assert.equal(app.panels.length, 1)
+  app.treeViews.get('palimpsest.launcher').setVisible(true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(app.panels[0].revealCount, 0)
+})
+
+test('a cancelled repository picker does not reopen from duplicate or in-flight visibility events', async (t) => {
+  const app = await fixture(t)
+  app.vscode.workspace.workspaceFolders = []
+  let calls = 0
+  let cancel
+  app.vscode.window.showOpenDialog = async () => {
+    calls += 1
+    if (calls === 1) return new Promise((resolve) => { cancel = () => resolve(undefined) })
+    return undefined
+  }
+  const launcher = app.treeViews.get('palimpsest.launcher')
+  launcher.setVisible(true)
+  await until(() => calls === 1)
+  launcher.setVisible(false)
+  launcher.setVisible(true)
+  launcher.setVisible(true)
+  cancel()
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  launcher.setVisible(true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(calls, 1)
+  assert.equal(app.panels.length, 0)
+  launcher.setVisible(false)
+  launcher.setVisible(true)
+  await until(() => calls === 2)
+  assert.equal(app.panels.length, 0)
+})
+
+test('the Activity Bar respects workspace trust without repeatedly prompting for it', async (t) => {
+  const app = await fixture(t, { trusted: false, launcherVisible: true })
+  const launcher = app.treeViews.get('palimpsest.launcher')
+  launcher.setVisible(false)
+  launcher.setVisible(true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(app.panels.length, 0)
+  assert.equal(app.io.clients.length, 0)
+  assert.deepEqual(app.notifications, [])
+  app.vscode.workspace.isTrusted = true
+  launcher.setVisible(false)
+  launcher.setVisible(true)
+  await until(() => !!app.panels[0]?.webview.html)
+  assert.equal(app.panels.length, 1)
 })
 
 test('opening a native floating window focuses and moves the existing workbench once', async (t) => {

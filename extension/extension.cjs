@@ -430,8 +430,24 @@ function activate(context) {
     try { await view.initialize() } catch (error) { view.panel.dispose(); throw error }
     return view
   }
+  const launcher = vscode.window.createTreeView(LAUNCHER_VIEW, {
+    treeDataProvider: { getTreeItem: (item) => item, getChildren: () => [] },
+    showCollapseAll: false,
+  })
+  let launcherVisible = false
+  let launcherOpening = false
+  const openVisibleLauncher = () => {
+    const becameVisible = launcher.visible && !launcherVisible
+    launcherVisible = launcher.visible
+    if (!becameVisible || launcherOpening || !vscode.workspace.isTrusted) return
+    // A click opens the workbench once. Focus/duplicate visibility events and
+    // a cancelled native picker cannot start another queued opening attempt.
+    launcherOpening = true
+    void run(async () => { if (launcher.visible) await open() }).finally(() => { launcherOpening = false })
+  }
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider(LAUNCHER_VIEW, { getTreeItem: (item) => item, getChildren: () => [] }),
+    launcher,
+    launcher.onDidChangeVisibility(openVisibleLauncher),
     vscode.commands.registerCommand('palimpsest.open', () => run(() => open())),
     vscode.commands.registerCommand('palimpsest.openChanges', () => run(async () => { (await open())?.showWorkspace() })),
     vscode.commands.registerCommand('palimpsest.openInNewWindow', () => run(async () => { await openFloatingWindow(await open()) })),
@@ -453,6 +469,8 @@ function activate(context) {
       },
     }),
   )
+  // The view may already be visible when onView activation creates it.
+  openVisibleLauncher()
 }
 
 async function deactivate() {

@@ -2,7 +2,7 @@
   "name": "palimpsest-git-history",
   "displayName": "Palimpsest — Git Workbench",
   "description": "A Git workbench with interactive history, working changes, branches, and a native floating window.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "wenhaoquestion",
   "license": "UNLICENSED",
   "repository": {
@@ -56,7 +56,7 @@
       "activitybar": [
         {
           "id": "palimpsest",
-          "title": "Palimpsest",
+          "title": "Palimpsest — Git Workbench",
           "icon": "media/activity-icon.svg"
         }
       ]
@@ -66,7 +66,7 @@
         {
           "id": "palimpsest.launcher",
           "name": "Git Workbench",
-          "contextualTitle": "Palimpsest"
+          "contextualTitle": "Palimpsest — Git Workbench"
         }
       ]
     },

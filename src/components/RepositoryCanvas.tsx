@@ -15,10 +15,11 @@ import type {
 import type { ChangeKind, CommitLandscape, FileChange, TreeFile } from '../types/git'
 import {
   buildRepositoryLayout,
+  directoryOf,
+  REPOSITORY_BLOCK_LIMIT,
   CHANGE_COLORS,
   ISO_X,
   ISO_Y,
-  projectIsometric,
   topLevelOf,
 } from '../lib/repository-layout'
 import type {
@@ -87,15 +88,20 @@ const MAX_ZOOM = 4.8
 const MOTION_DURATION = 420
 const RAPID_LAYOUT_WINDOW = 180
 const ZOOM_SETTLE_DELAY = 100
-// A viewport-sized raster avoids replaying thousands of Canvas commands on
-// every pointer frame. Two surfaces (only during a commit dissolve) use at
-// most 32 MiB of RGBA pixels, independent of repository size and world zoom.
-const MAX_SCENE_PIXELS = 4 * 1024 * 1024
-const MAX_SCENE_DIMENSION = 4096
+// Static views retain native pixels through 4K, including Retina displays.
+// Gestures use a smaller backing store and a prepared preview, then restore
+// the native raster on release. All retained surfaces share a 128 MiB RGBA
+// pixel budget; overscan never grows with world zoom or repository size.
+const MAX_DISPLAY_PIXELS = 12 * 1024 * 1024
+const MAX_SCENE_PIXELS = 12 * 1024 * 1024
+const MAX_INTERACTION_PIXELS = 4 * 1024 * 1024
+const MAX_TOTAL_PIXELS = 32 * 1024 * 1024
+const MAX_SCENE_DIMENSION = 8192
 const SCENE_OVERSCAN = 144
 
 interface SceneRaster {
   canvas: HTMLCanvasElement
+  preview: HTMLCanvasElement | null
   camera: Camera
   size: CanvasSize
   viewport: CanvasSize
@@ -213,36 +219,19 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
   const zoomSettlingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hoverRef = useRef<HitRegion | null>(null)
   const dragRef = useRef<DragState | null>(null)
-  const continuityLayoutRef = useRef<RepositoryLayout | null>(null)
   const [hover, setHover] = useState<HoverInfo | null>(null)
 
-  const layoutOptions = useMemo(() => ({
-    maxBlocks: focusMode === 'inspect' ? 620 : 440,
+  // A snapshot owns its geometry. Modes and selection only change paint so
+  // returning to a commit restores the same collision-free grid and depth order.
+  const layout = useMemo(() => buildRepositoryLayout(files, changes, {
+    maxBlocks: REPOSITORY_BLOCK_LIMIT,
     sourceFileCount: landscape?.totalFiles,
     sourceDirectoryCount: landscape?.totalDirectories,
     sourceTotalBytes: landscape?.totalBytes,
     directorySummaries: landscape?.directories,
-  }), [focusMode, landscape])
-  const rawLayout = useMemo(
-    () => buildRepositoryLayout(files, changes, layoutOptions),
-    [files, changes, layoutOptions],
-  )
-  // Highlighting an existing block changes paint only. Re-sample only when an
-  // inspected file is outside the bounded landscape's visible sample.
-  const selectedLayout = useMemo(() => {
-    if (!selectedPath || rawLayout.blocks.some((block) => block.path === selectedPath)) return rawLayout
-    return buildRepositoryLayout(files, changes, { ...layoutOptions, selectedPath })
-  }, [rawLayout, files, changes, layoutOptions, selectedPath])
-  const layout = useMemo(
-    () => stabilizeRepositoryLayout(selectedLayout, continuityLayoutRef.current),
-    [selectedLayout],
-  )
+  }), [files, changes, landscape])
   const layoutRef = useRef(layout)
   layoutRef.current = layout
-
-  useLayoutEffect(() => {
-    continuityLayoutRef.current = layout
-  }, [layout])
 
   const scheduleDraw = useCallback(() => {
     if (frameRef.current !== null || document.hidden) return
@@ -295,6 +284,17 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
       if (needsRaster) {
         releaseRaster(previousRasterRef.current)
         previousRasterRef.current = null
+        const metrics = sceneRasterMetrics(size)
+        const displayPixels = Math.floor(size.width * size.dpr) * Math.floor(size.height * size.dpr)
+        const keepPrevious = raster && raster.layout !== activeLayout && changeProgress < 1 && !reducedMotion
+          && displayPixels + rasterPixels(raster) + metrics.totalPixels <= MAX_TOTAL_PIXELS
+        // Release before allocating: checking after allocation would allow a
+        // transient third high-resolution surface to exceed the pixel budget.
+        if (!keepPrevious) {
+          releaseRaster(raster)
+          rasterRef.current = null
+          raster = null
+        }
         const next = createSceneRaster({
           layout: activeLayout,
           size,
@@ -307,10 +307,9 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
           // new snapshots dissolve below, so motion no longer repaints every
           // directory, facade, label, and hit polygon for 420 ms.
           showEmpty: activeLayout.sourceFileCount === 0,
-        })
+        }, metrics)
         if (next) {
-          if (raster && raster.layout !== activeLayout && changeProgress < 1 && !reducedMotion) {
-            releaseRaster(previousRasterRef.current)
+          if (raster && keepPrevious) {
             previousRasterRef.current = raster
           } else {
             releaseRaster(raster)
@@ -324,16 +323,22 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
         }
       }
 
-      context.setTransform(size.dpr, 0, 0, size.dpr, 0, 0)
+      const interacting = zoomPreview || Boolean(dragRef.current?.moved)
+        || (previousRasterRef.current !== null && changeProgress < 1)
+      const displayDpr = interacting
+        ? Math.min(size.dpr, Math.sqrt(MAX_INTERACTION_PIXELS / (size.width * size.height)))
+        : size.dpr
+      resizeBackingStore(canvas, size, displayDpr)
+      context.setTransform(displayDpr, 0, 0, displayDpr, 0, 0)
       context.fillStyle = '#0e100f'
       context.fillRect(0, 0, size.width, size.height)
       if (raster) {
         const previous = previousRasterRef.current
         if (previous && changeProgress < 1) {
-          compositeRaster(context, previous, camera)
+          compositeRaster(context, previous, camera, interacting)
           context.globalAlpha = easeOutCubic(changeProgress)
         }
-        compositeRaster(context, raster, camera)
+        compositeRaster(context, raster, camera, interacting)
         context.globalAlpha = 1
         hitRegionsRef.current = raster.regions
         hitCameraRef.current = raster.camera
@@ -372,18 +377,21 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
       const width = Math.max(1, Math.round(rect.width))
       const height = Math.max(1, Math.round(rect.height))
       const nativeDpr = window.devicePixelRatio || 1
-      const pixelBudget = width * height > 1_050_000 ? 1.45 : 1.75
       const dpr = Math.min(
-        pixelBudget, nativeDpr,
-        Math.sqrt(MAX_SCENE_PIXELS / (width * height)),
+        nativeDpr,
+        Math.sqrt(MAX_DISPLAY_PIXELS / (width * height)),
         MAX_SCENE_DIMENSION / width,
         MAX_SCENE_DIMENSION / height,
       )
       const previous = sizeRef.current
       if (previous.width === width && previous.height === height && previous.dpr === dpr) return
       sizeRef.current = { width, height, dpr }
-      canvas.width = Math.max(1, Math.round(width * dpr))
-      canvas.height = Math.max(1, Math.round(height * dpr))
+      // Discard the previous viewport's textures before growing the display.
+      releaseRaster(rasterRef.current)
+      releaseRaster(previousRasterRef.current)
+      rasterRef.current = null
+      previousRasterRef.current = null
+      resizeBackingStore(canvas, sizeRef.current, dpr)
       // A resize must not silently reframe a view that the user is navigating.
       // Only establish the initial camera once real repository geometry exists;
       // subsequent layout changes are intentionally camera-neutral.
@@ -407,7 +415,20 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
     resize()
     const observer = new ResizeObserver(resize)
     observer.observe(container)
-    return () => observer.disconnect()
+    let resolutionQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+    const handleResolutionChange = () => {
+      resize()
+      resolutionQuery.removeEventListener('change', handleResolutionChange)
+      resolutionQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+      resolutionQuery.addEventListener('change', handleResolutionChange)
+    }
+    resolutionQuery.addEventListener('change', handleResolutionChange)
+    window.addEventListener('resize', resize)
+    return () => {
+      observer.disconnect()
+      resolutionQuery.removeEventListener('change', handleResolutionChange)
+      window.removeEventListener('resize', resize)
+    }
   }, [focusMode, scheduleDraw])
 
   useLayoutEffect(() => {
@@ -590,8 +611,11 @@ export const RepositoryCanvas = memo(function RepositoryCanvas({
         else onSelectDirectory(hit.path)
       }
       updateHover(hit, x, y)
+      // The final pointer frame restores the native-resolution display even
+      // when hover identity did not change during the drag.
+      scheduleDraw()
     },
-    [onSelectDirectory, onSelectFile, updateHover],
+    [onSelectDirectory, onSelectFile, scheduleDraw, updateHover],
   )
 
   const handlePointerLeave = useCallback(
@@ -822,12 +846,9 @@ function paintRepositoryScene(context: CanvasRenderingContext2D, options: SceneO
 
   const hitRegions: HitRegion[] = []
   const orderedDirectories = layout.directories
-  const selectedBlock = options.selectedPath
-    ? layout.blocks.find((block) => !block.aggregate && block.path === options.selectedPath)
-    : undefined
   const focusTopLevel = options.selectedDirectory !== null
     ? topLevelOf(options.selectedDirectory)
-    : selectedBlock?.topLevelPath ?? null
+    : options.selectedPath ? topLevelOf(directoryOf(options.selectedPath)) : null
 
   for (const directory of orderedDirectories) {
     if (!isVisible(directory.x, directory.y, directory.width, directory.depth,
@@ -864,20 +885,48 @@ function paintRepositoryScene(context: CanvasRenderingContext2D, options: SceneO
   return hitRegions
 }
 
-function createSceneRaster(options: SceneOptions): SceneRaster | null {
+interface SceneRasterMetrics {
+  padding: number
+  dpr: number
+  width: number
+  height: number
+  previewWidth: number
+  previewHeight: number
+  totalPixels: number
+}
+
+function sceneRasterMetrics(viewport: CanvasSize): SceneRasterMetrics {
+  const { width, height, dpr } = viewport
+  // Reduce overscan before reducing detail. A native-DPR viewport that fits
+  // the display budget must not become blurry merely to add pan margins.
+  const availablePadding = (
+    Math.sqrt((width - height) ** 2 + 4 * MAX_SCENE_PIXELS / (dpr * dpr)) - width - height
+  ) / 4
+  const padding = Math.max(0, Math.floor(Math.min(
+    SCENE_OVERSCAN,
+    Math.min(width, height) * 0.2,
+    availablePadding,
+    (MAX_SCENE_DIMENSION / dpr - width) / 2,
+    (MAX_SCENE_DIMENSION / dpr - height) / 2,
+  )))
+  const pixelWidth = Math.max(1, Math.floor((width + padding * 2) * dpr))
+  const pixelHeight = Math.max(1, Math.floor((height + padding * 2) * dpr))
+  const pixels = pixelWidth * pixelHeight
+  const previewScale = Math.min(1, Math.sqrt(MAX_INTERACTION_PIXELS / pixels))
+  const previewWidth = previewScale < 1 ? Math.max(1, Math.floor(pixelWidth * previewScale)) : 0
+  const previewHeight = previewScale < 1 ? Math.max(1, Math.floor(pixelHeight * previewScale)) : 0
+  return {
+    padding, dpr, width: pixelWidth, height: pixelHeight, previewWidth, previewHeight,
+    totalPixels: pixels + previewWidth * previewHeight,
+  }
+}
+
+function createSceneRaster(options: SceneOptions, metrics: SceneRasterMetrics): SceneRaster | null {
   const viewport = options.size
-  const padding = Math.min(SCENE_OVERSCAN, Math.round(Math.min(viewport.width, viewport.height) * 0.2))
-  const width = viewport.width + padding * 2
-  const height = viewport.height + padding * 2
-  const dpr = Math.min(
-    viewport.dpr,
-    Math.sqrt(MAX_SCENE_PIXELS / (width * height)),
-    MAX_SCENE_DIMENSION / width,
-    MAX_SCENE_DIMENSION / height,
-  )
+  const { padding, dpr } = metrics
   const canvas = document.createElement('canvas')
-  canvas.width = Math.max(1, Math.floor(width * dpr))
-  canvas.height = Math.max(1, Math.floor(height * dpr))
+  canvas.width = metrics.width
+  canvas.height = metrics.height
   const context = canvas.getContext('2d', { alpha: false })
   if (!context) {
     canvas.width = canvas.height = 0
@@ -888,11 +937,24 @@ function createSceneRaster(options: SceneOptions): SceneRaster | null {
     offsetX: options.camera.offsetX + padding,
     offsetY: options.camera.offsetY + padding,
   }
-  const size = { width, height, dpr }
+  const size = { width: canvas.width / dpr, height: canvas.height / dpr, dpr }
   context.setTransform(dpr, 0, 0, dpr, 0, 0)
   const regions = paintRepositoryScene(context, { ...options, size, camera })
+  let preview: HTMLCanvasElement | null = null
+  if (metrics.previewWidth > 0) {
+    preview = document.createElement('canvas')
+    preview.width = metrics.previewWidth
+    preview.height = metrics.previewHeight
+    const previewContext = preview.getContext('2d', { alpha: false })
+    if (previewContext) {
+      previewContext.drawImage(canvas, 0, 0, preview.width, preview.height)
+    } else {
+      preview.width = preview.height = 0
+      preview = null
+    }
+  }
   return {
-    canvas, camera, size, viewport, layout: options.layout,
+    canvas, preview, camera, size, viewport, layout: options.layout,
     focusMode: options.focusMode, selectedPath: options.selectedPath,
     selectedDirectory: options.selectedDirectory, regions,
   }
@@ -904,10 +966,10 @@ function rasterCoversViewport(raster: SceneRaster, camera: Camera, size: CanvasS
   return x <= 0 && y <= 0 && x + raster.size.width >= size.width && y + raster.size.height >= size.height
 }
 
-function compositeRaster(context: CanvasRenderingContext2D, raster: SceneRaster, camera: Camera): void {
+function compositeRaster(context: CanvasRenderingContext2D, raster: SceneRaster, camera: Camera, preview: boolean): void {
   const ratio = camera.zoom / raster.camera.zoom
   context.drawImage(
-    raster.canvas,
+    preview && raster.preview ? raster.preview : raster.canvas,
     camera.offsetX - raster.camera.offsetX * ratio,
     camera.offsetY - raster.camera.offsetY * ratio,
     raster.size.width * ratio,
@@ -917,7 +979,27 @@ function compositeRaster(context: CanvasRenderingContext2D, raster: SceneRaster,
 
 function releaseRaster(raster: SceneRaster | null): void {
   // Reset dimensions to promptly release the browser's pixel/GPU backing store.
-  if (raster) raster.canvas.width = raster.canvas.height = 0
+  if (raster) {
+    raster.canvas.width = raster.canvas.height = 0
+    if (raster.preview) raster.preview.width = raster.preview.height = 0
+  }
+}
+
+function rasterPixels(raster: SceneRaster): number {
+  return raster.canvas.width * raster.canvas.height
+    + (raster.preview ? raster.preview.width * raster.preview.height : 0)
+}
+
+function resizeBackingStore(canvas: HTMLCanvasElement, size: CanvasSize, dpr: number): void {
+  const width = Math.max(1, Math.floor(size.width * dpr))
+  const height = Math.max(1, Math.floor(size.height * dpr))
+  if (canvas.width !== width || canvas.height !== height) {
+    // Drop the old allocation first: a portrait-to-landscape resize must not
+    // briefly allocate newWidth × oldHeight beyond the pixel budget.
+    canvas.width = 0
+    canvas.height = height
+    canvas.width = width
+  }
 }
 
 function hitTestAtCamera(regions: HitRegion[], x: number, y: number, camera: Camera, rasterCamera: Camera): HitRegion | null {
@@ -1622,156 +1704,6 @@ function toScreen(x: number, y: number, z: number, camera: Camera): LayoutPoint 
 
 function hasRenderableGeometry(layout: RepositoryLayout): boolean {
   return layout.sourceFileCount > 0 || layout.blocks.length > 0 || layout.directories.length > 0
-}
-
-/**
- * Preserve the repository's mental map between commits. The layout algorithm
- * is deterministic for one snapshot, but a sampled file entering or leaving a
- * district can otherwise repack every district after it. Re-anchor shared
- * top-level districts to their previous centers, then softly retain positions
- * for file blocks that exist in both snapshots. Work stays linear in the
- * bounded visualization payload.
- */
-function stabilizeRepositoryLayout(
-  next: RepositoryLayout,
-  previous: RepositoryLayout | null,
-): RepositoryLayout {
-  if (!previous || !hasRenderableGeometry(previous) || !hasRenderableGeometry(next)) return next
-
-  const previousDistricts = new Map(
-    previous.directories
-      .filter((directory) => directory.level === 0)
-      .map((directory) => [directory.path, directory] as const),
-  )
-  const offsets = new Map<string, LayoutPoint>()
-  for (const directory of next.directories) {
-    if (directory.level !== 0) continue
-    const anchor = previousDistricts.get(directory.path)
-    if (!anchor) continue
-    offsets.set(directory.path, {
-      x: anchor.x + anchor.width / 2 - (directory.x + directory.width / 2),
-      y: anchor.y + anchor.depth / 2 - (directory.y + directory.depth / 2),
-    })
-  }
-  if (offsets.size === 0) return next
-
-  const offsetFor = (topLevelPath: string): LayoutPoint => offsets.get(topLevelPath) ?? ZERO_POINT
-  const directories = next.directories.map((directory) => {
-    const offset = offsetFor(directory.topLevelPath)
-    return offset === ZERO_POINT
-      ? directory
-      : { ...directory, x: directory.x + offset.x, y: directory.y + offset.y }
-  })
-
-  const previousBlocks = new Map(previous.blocks.map((block) => [block.id, block] as const))
-  const blocks = next.blocks.map((block) => {
-    const offset = offsetFor(block.topLevelPath)
-    const translatedX = block.x + offset.x
-    const translatedY = block.y + offset.y
-    const anchor = previousBlocks.get(block.id)
-    if (!anchor || anchor.topLevelPath !== block.topLevelPath) {
-      return offset === ZERO_POINT ? block : { ...block, x: translatedX, y: translatedY }
-    }
-    // Most of the old position is retained, avoiding slot-to-slot jumps while
-    // still allowing the local packing to settle gradually as a district grows.
-    return {
-      ...block,
-      x: lerp(anchor.x, translatedX, 0.2),
-      y: lerp(anchor.y, translatedY, 0.2),
-    }
-  })
-
-  const roads = next.roads.map((road) => {
-    const fromOffset = offsetFor(topLevelOf(road.fromPath))
-    const toOffset = offsetFor(topLevelOf(road.toPath))
-    return {
-      ...road,
-      from: { x: road.from.x + fromOffset.x, y: road.from.y + fromOffset.y },
-      to: { x: road.to.x + toOffset.x, y: road.to.y + toOffset.y },
-    }
-  })
-  const traces = next.traces.map((trace) => {
-    const fromOffset = offsetFor(topLevelOf(trace.fromDirectory))
-    const toOffset = offsetFor(topLevelOf(trace.toDirectory))
-    return {
-      ...trace,
-      from: { x: trace.from.x + fromOffset.x, y: trace.from.y + fromOffset.y },
-      to: { x: trace.to.x + toOffset.x, y: trace.to.y + toOffset.y },
-    }
-  })
-  const stabilizedBounds = boundsForStabilizedLayout(directories, blocks)
-
-  return {
-    ...next,
-    blocks,
-    directories,
-    roads,
-    traces,
-    bounds: stabilizedBounds.bounds,
-    projectedBounds: stabilizedBounds.projectedBounds,
-  }
-}
-
-const ZERO_POINT: LayoutPoint = { x: 0, y: 0 }
-
-function boundsForStabilizedLayout(
-  directories: DirectoryDistrict[],
-  blocks: FileBlock[],
-): { bounds: RepositoryLayout['bounds']; projectedBounds: RepositoryLayout['projectedBounds'] } {
-  let minX = Number.POSITIVE_INFINITY
-  let minY = Number.POSITIVE_INFINITY
-  let maxX = Number.NEGATIVE_INFINITY
-  let maxY = Number.NEGATIVE_INFINITY
-  let maximumElevation = 0
-
-  for (const directory of directories) {
-    minX = Math.min(minX, directory.x)
-    minY = Math.min(minY, directory.y)
-    maxX = Math.max(maxX, directory.x + directory.width)
-    maxY = Math.max(maxY, directory.y + directory.depth)
-    maximumElevation = Math.max(maximumElevation, directory.elevation)
-  }
-  for (const block of blocks) {
-    minX = Math.min(minX, block.x)
-    minY = Math.min(minY, block.y)
-    maxX = Math.max(maxX, block.x + block.width)
-    maxY = Math.max(maxY, block.y + block.depth)
-    maximumElevation = Math.max(maximumElevation, block.baseElevation + block.height)
-  }
-  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
-    return {
-      bounds: { minX: -12, minY: -12, maxX: 140, maxY: 110 },
-      projectedBounds: { minX: -110, minY: -48, maxX: 140, maxY: 140 },
-    }
-  }
-
-  const margin = 12
-  const bounds = {
-    minX: minX - margin,
-    minY: minY - margin,
-    maxX: maxX + margin,
-    maxY: maxY + margin,
-  }
-  const elevated = maximumElevation + 24
-  const corners = [
-    projectIsometric(bounds.minX, bounds.minY, 0),
-    projectIsometric(bounds.maxX, bounds.minY, 0),
-    projectIsometric(bounds.maxX, bounds.maxY, 0),
-    projectIsometric(bounds.minX, bounds.maxY, 0),
-    projectIsometric(bounds.minX, bounds.minY, elevated),
-    projectIsometric(bounds.maxX, bounds.minY, elevated),
-    projectIsometric(bounds.maxX, bounds.maxY, elevated),
-    projectIsometric(bounds.minX, bounds.maxY, elevated),
-  ]
-  return {
-    bounds,
-    projectedBounds: {
-      minX: Math.min(...corners.map((point) => point.x)),
-      minY: Math.min(...corners.map((point) => point.y)),
-      maxX: Math.max(...corners.map((point) => point.x)),
-      maxY: Math.max(...corners.map((point) => point.y)),
-    },
-  }
 }
 
 function fitCamera(

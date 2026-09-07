@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Clicking the Activity Bar icon now opens or reveals the workbench directly. Repeated visibility events do not reopen a cancelled folder picker.
+- Fixed overlapping buildings and cumulative position drift when changing commits. A snapshot now produces the same layout in both viewing modes; selecting a file keeps the map in place.
+- Restored sharp rendering on large and Retina displays with separate static and interaction resolutions, bounded canvas storage, and cache release before new allocations.
+
 ## 0.2.0
 
 - Added a dedicated Activity Bar entry, a native floating window, and commands for opening beside the editor or directly into working changes.

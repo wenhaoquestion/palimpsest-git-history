@@ -109,6 +109,8 @@ export const CHANGE_COLORS: Record<ChangeKind, string> = {
 
 export const ISO_X = 0.8660254038
 export const ISO_Y = 0.5
+// View modes change paint detail, while sharing one deterministic city plan.
+export const REPOSITORY_BLOCK_LIMIT = 620
 
 const ROOT_LABEL = 'Repository root'
 const CELL_SIZE = 18
@@ -208,7 +210,7 @@ export function buildRepositoryLayout(
   changes: FileChange[],
   options: RepositoryLayoutOptions = {},
 ): RepositoryLayout {
-  const maxBlocks = Math.max(80, options.maxBlocks ?? 560)
+  const maxBlocks = Math.max(80, options.maxBlocks ?? REPOSITORY_BLOCK_LIMIT)
   const normalizedSelectedPath = options.selectedPath ? normalizeGitPath(options.selectedPath) : null
   const inventory = buildVisualInventory(files, changes, maxBlocks, normalizedSelectedPath, {
     sourceFileCount: options.sourceFileCount,

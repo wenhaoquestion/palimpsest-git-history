@@ -41,7 +41,7 @@ code --install-extension wenhaoquestion.palimpsest-git-history
 After installation:
 
 1. Open a trusted workspace containing a Git repository.
-2. Click **Palimpsest** in the Activity Bar, or run **Palimpsest: Open Git Workbench**.
+2. Click **Palimpsest — Git Workbench** in the Activity Bar to open the workbench directly, or run **Palimpsest: Open Git Workbench**.
 3. Explore **History**, or open **Changes** to stage files and make a commit.
 
 Use **Open in New Window** to move the workbench into a native floating window, similar to other VS Code tools. Its current page, history position, and commit draft survive the move. **Open to the Side** places it beside your code. On hosts without the floating-window command, the extension opens to the side and explains the fallback.
@@ -65,7 +65,9 @@ With the history view focused, **Space** plays or pauses, **← / →** steps be
 
 History summaries and file listings load in pages. The landscape uses representative file blocks and directory totals to keep large trees readable; exact paths and diffs remain available through the inspector. Initial indexing of a large history can take longer than later navigation.
 
-Panning and continuous zooming reuse a viewport image, followed by a crisp redraw after zooming stops. Hover overlays do not rebuild the scene. The display and two cached canvases together allow at most 48 MiB of RGBA pixel storage; browser/GPU overhead is additional. Hidden views release cached canvases, and an idle scene draws no frames.
+Panning and continuous zooming reuse a compact viewport image, then restore native-DPR detail when the gesture ends. Static surfaces support up to 12M pixels; interaction surfaces use at most 4M. All display, scene, and preview surfaces share a 128 MiB RGBA storage budget; browser/GPU overhead is additional. Hidden views release cached canvases, and an idle scene draws no frames.
+
+A snapshot always produces the same grid. Switching Overview/Inspect or selecting a file keeps the buildings in place. Files outside the bounded visible sample highlight their directory; the inspector still provides their exact paths and diffs.
 
 Git runs in an isolated worker. Hiding the view pauses playback and cancels pending reads; the worker and its caches are released after an idle interval once running writes finish. Restoring the hidden view preserves the selected repository, branch scope, and commit position.
 
