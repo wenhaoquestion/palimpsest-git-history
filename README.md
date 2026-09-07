@@ -21,6 +21,8 @@ Ordinary repositories, linked worktrees, bare repositories, and empty repositori
 
 The separate [linux-history-website](linux-history-website/README.md) directory prepares and serves the full history available in the official `torvalds/linux` Git repository, without a shallow-history cutoff. It has its own data setup and deployment build, sharing this project's optimized renderer and Git service. Its public view is fixed to Linux and disables repository switching and administrative writes. The Linux repository data is downloaded separately and is not committed to this source repository.
 
+The complete local mirror has been verified offline: 1,482,108 commits with all reachable file contents. Run the site on [localhost:4180](http://127.0.0.1:4180), or build an independent deployment using the directory's instructions. See [real Linux measurements and browser validation](linux-history-website/VALIDATION.md).
+
 ## Standalone web app
 
 Requires Git and Node.js 20.19+ or 22.12+.
@@ -103,7 +105,9 @@ The complete memory workload takes 8.3 seconds before and 9.3 seconds after; con
 
 In a Chromium test, a 60-point drag triggered zero API reads while held and one destination history-page read after release; the snapshot settled in 234 ms, with no observed long tasks. In the actual VS Code webview, a 50-point drag had an 8.4 ms frame-interval p95 on the test display and loaded destination metadata 401 ms after release. Hiding and restoring the panel preserved its selected commit.
 
-These are local measurements, not a claim about every repository or display. Full Linux-history initial indexing still depends on Git graph traversal and disk speed and has not been benchmarked here. C++ was not added: removing unnecessary diff computation and retained buffers addressed the measured bottlenecks, while Git already performs repository operations natively.
+The complete Linux repository was also measured offline: indexing 1,482,108 commits took 18.06 seconds, random 128-commit pages took 29.9–31.4 ms, and landscapes took 390–869 ms. After this workload and garbage collection, the measured Node backend retained 13.7 MiB of heap and 125.3 MiB RSS, excluding Git subprocesses. The installed extension also opened this full repository in the user's local VS Code and navigated to its final commit.
+
+These are local measurements, not a claim about every repository or display. Initial indexing depends on Git graph traversal and disk speed. C++ was not added: removing unnecessary diff computation and retained buffers addressed the measured bottlenecks, while Git already performs repository operations natively.
 
 ## Validation and benchmarks
 

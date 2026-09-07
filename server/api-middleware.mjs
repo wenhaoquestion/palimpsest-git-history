@@ -269,7 +269,7 @@ export function createApiMiddleware({
       return
     }
 
-    void (async () => {
+    return (async () => {
       const method = (request.method || 'GET').toUpperCase()
       const readMethod = method === 'GET' || method === 'HEAD'
       if (readOnly && (!readMethod || url.pathname === '/api/refresh')) {

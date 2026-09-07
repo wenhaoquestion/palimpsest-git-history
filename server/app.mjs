@@ -128,7 +128,10 @@ export function createAppServer({
   const api = createApiMiddleware({ repoPath, service, readOnly, publicRepository, allowedRefs })
   let activeRequests = 0
   const server = createServer((request, response) => {
-    if ((request.url || '').startsWith('/api/')) {
+    let completeRequest = () => {}
+    let apiRequest = false
+    try { apiRequest = new URL(request.url || '/', 'http://localhost').pathname.startsWith('/api/') } catch {}
+    if (apiRequest) {
       if (activeRequests >= maxApiRequests) {
         response.setHeader('Retry-After', '1')
         response.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -138,15 +141,21 @@ export function createAppServer({
       }
       activeRequests += 1
       let released = false
-      const release = () => { if (!released) { released = true; activeRequests -= 1 } }
-      response.once('finish', release)
-      response.once('close', release)
+      let workComplete = false
+      let responseComplete = false
+      const release = () => {
+        if (!released && workComplete && responseComplete) { released = true; activeRequests -= 1 }
+      }
+      completeRequest = () => { workComplete = true; release() }
+      const completeResponse = () => { responseComplete = true; release() }
+      response.once('finish', completeResponse)
+      response.once('close', completeResponse)
     }
-    api(request, response, () => {
+    void Promise.resolve(api(request, response, () => {
       void serveStatic(resolvedDist, request, response).catch(() => {
         if (!response.writableEnded) sendText(response, 500, 'The request could not be completed.', request.method)
       })
-    })
+    })).finally(completeRequest)
   })
   server.dispose = () => api.dispose({ force: true })
   server.once('close', () => { void api.dispose() })

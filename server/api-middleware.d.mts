@@ -18,7 +18,7 @@ export interface GitHistoryApiOptions extends GitServiceOptions {
 }
 
 export interface GitApiMiddleware {
-  (request: IncomingMessage, response: ServerResponse, next?: () => void): void
+  (request: IncomingMessage, response: ServerResponse, next?: () => void): void | Promise<void>
   readonly service: unknown
   dispose(options?: { force?: boolean }): Promise<void>
 }
